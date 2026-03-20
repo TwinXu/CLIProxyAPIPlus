@@ -15,6 +15,7 @@ import (
 	kirocommon "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/kiro/common"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 // remoteWebSearchDescription is a minimal fallback for when dynamic fetch from MCP tools/list hasn't completed yet.
@@ -194,6 +195,17 @@ func BuildKiroPayload(claudeBody []byte, modelID, profileArn, origin string, isA
 	// This supports Claude API format, OpenAI reasoning_effort, AMP/Cursor format, and Anthropic-Beta header
 	thinkingEnabled := IsThinkingEnabledWithHeaders(claudeBody, headers)
 
+	// Strip Claude-specific fields not supported by Kiro API.
+	// Must be done AFTER thinking detection above (IsThinkingEnabledWithHeaders reads "thinking").
+	// Matches the same treatment in Codex (codex_claude_request.go:258-259)
+	// and Gemini (gemini_claude_request.go:143-144) translators.
+	// Note: messages/tools/system were already extracted above; sjson.DeleteBytes creates a new
+	// slice so those gjson.Result values remain valid and are unaffected.
+	claudeBody, _ = sjson.DeleteBytes(claudeBody, "thinking")
+	claudeBody, _ = sjson.DeleteBytes(claudeBody, "output_config")
+	claudeBody, _ = sjson.DeleteBytes(claudeBody, "context_management")
+	log.Debugf("kiro: stripped incompatible Claude fields: thinking, output_config, context_management")
+
 	// Inject timestamp context
 	timestamp := time.Now().Format("2006-01-02 15:04:05 MST")
 	timestampContext := fmt.Sprintf("[Context: Current time is %s]", timestamp)
@@ -288,6 +300,10 @@ func BuildKiroPayload(claudeBody []byte, modelID, profileArn, origin string, isA
 			inferenceConfig.MaxTokens = int(maxTokens)
 		}
 		if hasTemperature {
+			if temperature >= 1.0 {
+				temperature = 0.99
+				log.Debugf("kiro: capped temperature to 0.99 (Kiro requires < 1.0)")
+			}
 			inferenceConfig.Temperature = temperature
 		}
 		if hasTopP {
@@ -381,7 +397,8 @@ func checkThinkingMode(claudeBody []byte) (bool, int64) {
 	thinkingField := gjson.GetBytes(claudeBody, "thinking")
 	if thinkingField.Exists() {
 		thinkingType := thinkingField.Get("type").String()
-		if thinkingType == "enabled" {
+		switch thinkingType {
+		case "enabled":
 			thinkingEnabled = true
 			if bt := thinkingField.Get("budget_tokens"); bt.Exists() {
 				budgetTokens = bt.Int()
@@ -393,6 +410,17 @@ func checkThinkingMode(claudeBody []byte) (bool, int64) {
 			if thinkingEnabled {
 				log.Debugf("kiro: thinking mode enabled via Claude API parameter, budget_tokens: %d", budgetTokens)
 			}
+		case "adaptive", "auto":
+			// Adaptive/auto thinking (Claude 4.6+): enable thinking mode.
+			// output_config.effort and context_management are not forwarded to Kiro API
+			// (Kiro payload is built as a new struct; incompatible fields are naturally excluded).
+			thinkingEnabled = true
+			log.Debugf("kiro: thinking mode enabled via adaptive/auto thinking type")
+		case "disabled":
+			// Explicitly disabled: ensure thinking mode is off.
+			// defer_loading, cache_control in tools are also not forwarded (struct-based conversion).
+			thinkingEnabled = false
+			log.Debugf("kiro: thinking mode explicitly disabled")
 		}
 	}
 
@@ -553,12 +581,23 @@ func convertClaudeToolsToKiro(tools gjson.Result) []KiroToolWrapper {
 	}
 
 	for _, tool := range tools.Array() {
+		// Strip tool-level fields not supported by Kiro API tool specification.
+		// Matches Codex (codex_claude_request.go:258-259) and Gemini (gemini_claude_request.go:143-144).
+		toolRaw := tool.Raw
+		toolRaw, _ = sjson.Delete(toolRaw, "defer_loading")
+		toolRaw, _ = sjson.Delete(toolRaw, "cache_control")
+		tool = gjson.Parse(toolRaw)
+
 		name := tool.Get("name").String()
 		description := tool.Get("description").String()
 		inputSchemaResult := tool.Get("input_schema")
 		var inputSchema interface{}
 		if inputSchemaResult.Exists() && inputSchemaResult.Type != gjson.Null {
 			inputSchema = inputSchemaResult.Value()
+			// Strip $schema keyword — Kiro API does not support JSON Schema meta-schema declarations
+			if schemaMap, ok := inputSchema.(map[string]interface{}); ok {
+				delete(schemaMap, "$schema")
+			}
 		}
 		inputSchema = ensureKiroInputSchema(inputSchema)
 
@@ -904,6 +943,7 @@ func BuildAssistantMessageStruct(msg gjson.Result) KiroAssistantResponseMessage 
 	content := msg.Get("content")
 	var contentBuilder strings.Builder
 	var toolUses []KiroToolUse
+	seenToolUseIDs := make(map[string]bool)
 
 	if content.IsArray() {
 		for _, part := range content.Array() {
@@ -913,6 +953,14 @@ func BuildAssistantMessageStruct(msg gjson.Result) KiroAssistantResponseMessage 
 				contentBuilder.WriteString(part.Get("text").String())
 			case "tool_use":
 				toolUseID := part.Get("id").String()
+
+				// Deduplicate tool uses by ID — Kiro rejects duplicate toolUseIds
+				if seenToolUseIDs[toolUseID] {
+					log.Debugf("kiro: skipping duplicate tool_use with toolUseId: %s", toolUseID)
+					continue
+				}
+				seenToolUseIDs[toolUseID] = true
+
 				toolName := part.Get("name").String()
 				toolInput := part.Get("input")
 
@@ -923,6 +971,9 @@ func BuildAssistantMessageStruct(msg gjson.Result) KiroAssistantResponseMessage 
 						inputMap[key.String()] = value.Value()
 						return true
 					})
+				}
+				if inputMap == nil {
+					inputMap = make(map[string]interface{})
 				}
 
 				// Rename web_search → remote_web_search to match convertClaudeToolsToKiro
