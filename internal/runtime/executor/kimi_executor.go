@@ -69,6 +69,7 @@ func (e *KimiExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	from := opts.SourceFormat
 	if from.String() == "claude" {
 		auth.Attributes["base_url"] = kimiauth.KimiAPIBaseURL
+		auth.Attributes["no_cache_control_inject"] = "true"
 		return e.ClaudeExecutor.Execute(ctx, auth, req, opts)
 	}
 
@@ -170,6 +171,7 @@ func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	from := opts.SourceFormat
 	if from.String() == "claude" {
 		auth.Attributes["base_url"] = kimiauth.KimiAPIBaseURL
+		auth.Attributes["no_cache_control_inject"] = "true"
 		return e.ClaudeExecutor.ExecuteStream(ctx, auth, req, opts)
 	}
 

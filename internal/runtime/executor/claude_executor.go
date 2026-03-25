@@ -133,18 +133,22 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	body = disableThinkingIfToolChoiceForced(body)
 
 	// Auto-inject cache_control if missing (optimization for ClawdBot/clients without caching support)
-	if countCacheControls(body) == 0 {
+	// Skip for upstreams that don't support prompt caching (e.g. Kimi), indicated by no_cache_control_inject.
+	skipCacheInject := auth != nil && auth.Attributes != nil && auth.Attributes["no_cache_control_inject"] == "true"
+	if !skipCacheInject && countCacheControls(body) == 0 {
 		body = ensureCacheControl(body)
 	}
 
 	// Enforce Anthropic's cache_control block limit (max 4 breakpoints per request).
 	// Cloaking and ensureCacheControl may push the total over 4 when the client
 	// (e.g. Amp CLI) already sends multiple cache_control blocks.
-	body = enforceCacheControlLimit(body, 4)
+	if !skipCacheInject {
+		body = enforceCacheControlLimit(body, 4)
 
-	// Normalize TTL values to prevent ordering violations under prompt-caching-scope-2026-01-05.
-	// A 1h-TTL block must not appear after a 5m-TTL block in evaluation order (tools→system→messages).
-	body = normalizeCacheControlTTL(body)
+		// Normalize TTL values to prevent ordering violations under prompt-caching-scope-2026-01-05.
+		// A 1h-TTL block must not appear after a 5m-TTL block in evaluation order (tools→system→messages).
+		body = normalizeCacheControlTTL(body)
+	}
 
 	// Extract betas from body and convert to header
 	var extraBetas []string
@@ -299,15 +303,19 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	body = disableThinkingIfToolChoiceForced(body)
 
 	// Auto-inject cache_control if missing (optimization for ClawdBot/clients without caching support)
-	if countCacheControls(body) == 0 {
+	// Skip for upstreams that don't support prompt caching (e.g. Kimi), indicated by no_cache_control_inject.
+	skipCacheInjectStream := auth != nil && auth.Attributes != nil && auth.Attributes["no_cache_control_inject"] == "true"
+	if !skipCacheInjectStream && countCacheControls(body) == 0 {
 		body = ensureCacheControl(body)
 	}
 
 	// Enforce Anthropic's cache_control block limit (max 4 breakpoints per request).
-	body = enforceCacheControlLimit(body, 4)
+	if !skipCacheInjectStream {
+		body = enforceCacheControlLimit(body, 4)
 
-	// Normalize TTL values to prevent ordering violations under prompt-caching-scope-2026-01-05.
-	body = normalizeCacheControlTTL(body)
+		// Normalize TTL values to prevent ordering violations under prompt-caching-scope-2026-01-05.
+		body = normalizeCacheControlTTL(body)
+	}
 
 	// Extract betas from body and convert to header
 	var extraBetas []string
@@ -826,6 +834,16 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	}
 
 	baseBetas := "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05"
+	if auth != nil && auth.Attributes != nil && auth.Attributes["no_cache_control_inject"] == "true" {
+		// Upstream doesn't support prompt caching; strip prompt-caching-scope betas to avoid 400 errors.
+		filtered := make([]string, 0, 5)
+		for _, b := range strings.Split(baseBetas, ",") {
+			if !strings.HasPrefix(strings.TrimSpace(b), "prompt-caching-scope") {
+				filtered = append(filtered, strings.TrimSpace(b))
+			}
+		}
+		baseBetas = strings.Join(filtered, ",")
+	}
 	if val := strings.TrimSpace(ginHeaders.Get("Anthropic-Beta")); val != "" {
 		baseBetas = val
 		if !strings.Contains(val, "oauth") {
