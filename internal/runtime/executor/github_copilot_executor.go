@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
@@ -40,7 +42,7 @@ const (
 	copilotEditorVersion = "vscode/1.107.0"
 	copilotPluginVersion = "copilot-chat/0.35.0"
 	copilotIntegrationID = "vscode-chat"
-	copilotOpenAIIntent  = "conversation-panel"
+	copilotOpenAIIntent  = "conversation-edits"
 	copilotGitHubAPIVer  = "2025-04-01"
 )
 
@@ -126,6 +128,7 @@ func (e *GitHubCopilotExecutor) Execute(ctx context.Context, auth *cliproxyauth.
 	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), false)
 	body = e.normalizeModel(req.Model, body)
 	body = flattenAssistantContent(body)
+	body = stripUnsupportedBetas(body)
 
 	// Detect vision content before input normalization removes messages
 	hasVision := detectVisionContent(body)
@@ -142,6 +145,7 @@ func (e *GitHubCopilotExecutor) Execute(ctx context.Context, auth *cliproxyauth.
 	if useResponses {
 		body = normalizeGitHubCopilotResponsesInput(body)
 		body = normalizeGitHubCopilotResponsesTools(body)
+		body = applyGitHubCopilotResponsesDefaults(body)
 	} else {
 		body = normalizeGitHubCopilotChatTools(body)
 	}
@@ -221,13 +225,14 @@ func (e *GitHubCopilotExecutor) Execute(ctx context.Context, auth *cliproxyauth.
 	}
 
 	var param any
-	converted := ""
+	var converted []byte
 	if useResponses && from.String() == "claude" {
 		converted = translateGitHubCopilotResponsesNonStreamToClaude(data)
 	} else {
+		data = normalizeGitHubCopilotReasoningField(data)
 		converted = sdktranslator.TranslateNonStream(ctx, to, from, req.Model, bytes.Clone(opts.OriginalRequest), body, data, &param)
 	}
-	resp = cliproxyexecutor.Response{Payload: []byte(converted)}
+	resp = cliproxyexecutor.Response{Payload: converted, Headers: httpResp.Header.Clone()}
 	reporter.ensurePublished(ctx)
 	return resp, nil
 }
@@ -256,6 +261,7 @@ func (e *GitHubCopilotExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), true)
 	body = e.normalizeModel(req.Model, body)
 	body = flattenAssistantContent(body)
+	body = stripUnsupportedBetas(body)
 
 	// Detect vision content before input normalization removes messages
 	hasVision := detectVisionContent(body)
@@ -272,6 +278,7 @@ func (e *GitHubCopilotExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 	if useResponses {
 		body = normalizeGitHubCopilotResponsesInput(body)
 		body = normalizeGitHubCopilotResponsesTools(body)
+		body = applyGitHubCopilotResponsesDefaults(body)
 	} else {
 		body = normalizeGitHubCopilotChatTools(body)
 	}
@@ -374,14 +381,27 @@ func (e *GitHubCopilotExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 				}
 			}
 
-			var chunks []string
+			var chunks [][]byte
 			if useResponses && from.String() == "claude" {
 				chunks = translateGitHubCopilotResponsesStreamToClaude(bytes.Clone(line), &param)
 			} else {
-				chunks = sdktranslator.TranslateStream(ctx, to, from, req.Model, bytes.Clone(opts.OriginalRequest), body, bytes.Clone(line), &param)
+				// Strip SSE "data: " prefix before reasoning field normalization,
+				// since normalizeGitHubCopilotReasoningField expects pure JSON.
+				// Re-wrap with the prefix afterward for the translator.
+				normalizedLine := bytes.Clone(line)
+				if bytes.HasPrefix(line, dataTag) {
+					sseData := bytes.TrimSpace(line[len(dataTag):])
+					if !bytes.Equal(sseData, []byte("[DONE]")) && gjson.ValidBytes(sseData) {
+						normalized := normalizeGitHubCopilotReasoningField(bytes.Clone(sseData))
+						if !bytes.Equal(normalized, sseData) {
+							normalizedLine = append(append([]byte(nil), dataTag...), normalized...)
+						}
+					}
+				}
+				chunks = sdktranslator.TranslateStream(ctx, to, from, req.Model, bytes.Clone(opts.OriginalRequest), body, normalizedLine, &param)
 			}
 			for i := range chunks {
-				out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}
+				out <- cliproxyexecutor.StreamChunk{Payload: bytes.Clone(chunks[i])}
 			}
 		}
 
@@ -400,9 +420,28 @@ func (e *GitHubCopilotExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 	}, nil
 }
 
-// CountTokens is not supported for GitHub Copilot.
-func (e *GitHubCopilotExecutor) CountTokens(_ context.Context, _ *cliproxyauth.Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	return cliproxyexecutor.Response{}, statusErr{code: http.StatusNotImplemented, msg: "count tokens not supported for github-copilot"}
+// CountTokens estimates token count locally using tiktoken, since the GitHub
+// Copilot API does not expose a dedicated token counting endpoint.
+func (e *GitHubCopilotExecutor) CountTokens(ctx context.Context, _ *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	baseModel := thinking.ParseSuffix(req.Model).ModelName
+
+	from := opts.SourceFormat
+	to := sdktranslator.FromString("openai")
+	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
+
+	enc, err := helps.TokenizerForModel(baseModel)
+	if err != nil {
+		return cliproxyexecutor.Response{}, fmt.Errorf("github copilot executor: tokenizer init failed: %w", err)
+	}
+
+	count, err := helps.CountOpenAIChatTokens(enc, translated)
+	if err != nil {
+		return cliproxyexecutor.Response{}, fmt.Errorf("github copilot executor: token counting failed: %w", err)
+	}
+
+	usageJSON := helps.BuildOpenAIUsageJSON(count)
+	translatedUsage := sdktranslator.TranslateTokenCount(ctx, to, from, count, usageJSON)
+	return cliproxyexecutor.Response{Payload: translatedUsage}, nil
 }
 
 // Refresh validates the GitHub token is still working.
@@ -491,46 +530,127 @@ func (e *GitHubCopilotExecutor) applyHeaders(r *http.Request, apiToken string, b
 	r.Header.Set("X-Request-Id", uuid.NewString())
 
 	initiator := "user"
-	if role := detectLastConversationRole(body); role == "assistant" || role == "tool" {
+	if isAgentInitiated(body) {
 		initiator = "agent"
 	}
 	r.Header.Set("X-Initiator", initiator)
 }
 
-func detectLastConversationRole(body []byte) string {
+// isAgentInitiated determines whether the current request is agent-initiated
+// (tool callbacks, continuations) rather than user-initiated (new user prompt).
+//
+// GitHub Copilot uses the X-Initiator header for billing:
+//   - "user"  → consumes premium request quota
+//   - "agent" → free (tool loops, continuations)
+//
+// The challenge: Claude Code sends tool results as role:"user" messages with
+// content type "tool_result". After translation to OpenAI format, the tool_result
+// part becomes a separate role:"tool" message, but if the original Claude message
+// also contained text content (e.g. skill invocations, attachment descriptions),
+// a role:"user" message is emitted AFTER the tool message, making the last message
+// appear user-initiated when it's actually part of an agent tool loop.
+//
+// VSCode Copilot Chat solves this with explicit flags (iterationNumber,
+// isContinuation, subAgentInvocationId). Since CPA doesn't have these flags,
+// we infer agent status by checking whether the conversation contains prior
+// assistant/tool messages — if it does, the current request is a continuation.
+//
+// References:
+//   - opencode#8030, opencode#15824: same root cause and fix approach
+//   - vscode-copilot-chat: toolCallingLoop.ts (iterationNumber === 0)
+//   - pi-ai: github-copilot-headers.ts (last message role check)
+func isAgentInitiated(body []byte) bool {
 	if len(body) == 0 {
-		return ""
+		return false
 	}
 
+	// Chat Completions API: check messages array
 	if messages := gjson.GetBytes(body, "messages"); messages.Exists() && messages.IsArray() {
 		arr := messages.Array()
+		if len(arr) == 0 {
+			return false
+		}
+
+		lastRole := ""
 		for i := len(arr) - 1; i >= 0; i-- {
-			if role := arr[i].Get("role").String(); role != "" {
-				return role
+			if r := arr[i].Get("role").String(); r != "" {
+				lastRole = r
+				break
 			}
 		}
+
+		// If last message is assistant or tool, clearly agent-initiated.
+		if lastRole == "assistant" || lastRole == "tool" {
+			return true
+		}
+
+		// If last message is "user", check whether it contains tool results
+		// (indicating a tool-loop continuation) or if the preceding message
+		// is an assistant tool_use. This is more precise than checking for
+		// any prior assistant message, which would false-positive on genuine
+		// multi-turn follow-ups.
+		if lastRole == "user" {
+			// Check if the last user message contains tool_result content
+			lastContent := arr[len(arr)-1].Get("content")
+			if lastContent.Exists() && lastContent.IsArray() {
+				for _, part := range lastContent.Array() {
+					if part.Get("type").String() == "tool_result" {
+						return true
+					}
+				}
+			}
+			// Check if the second-to-last message is an assistant with tool_use
+			if len(arr) >= 2 {
+				prev := arr[len(arr)-2]
+				if prev.Get("role").String() == "assistant" {
+					prevContent := prev.Get("content")
+					if prevContent.Exists() && prevContent.IsArray() {
+						for _, part := range prevContent.Array() {
+							if part.Get("type").String() == "tool_use" {
+								return true
+							}
+						}
+					}
+				}
+			}
+		}
+
+		return false
 	}
 
+	// Responses API: check input array
 	if inputs := gjson.GetBytes(body, "input"); inputs.Exists() && inputs.IsArray() {
 		arr := inputs.Array()
-		for i := len(arr) - 1; i >= 0; i-- {
-			item := arr[i]
+		if len(arr) == 0 {
+			return false
+		}
 
-			// Most Responses input items carry a top-level role.
-			if role := item.Get("role").String(); role != "" {
-				return role
+		// Check last item
+		last := arr[len(arr)-1]
+		if role := last.Get("role").String(); role == "assistant" {
+			return true
+		}
+		switch last.Get("type").String() {
+		case "function_call", "function_call_arguments", "computer_call":
+			return true
+		case "function_call_output", "function_call_response", "tool_result", "computer_call_output":
+			return true
+		}
+
+		// If last item is user-role, check for prior non-user items
+		for _, item := range arr {
+			if role := item.Get("role").String(); role == "assistant" {
+				return true
 			}
-
 			switch item.Get("type").String() {
-			case "function_call", "function_call_arguments", "computer_call":
-				return "assistant"
-			case "function_call_output", "function_call_response", "tool_result", "computer_call_output":
-				return "tool"
+			case "function_call", "function_call_output", "function_call_response",
+				"function_call_arguments", "computer_call", "computer_call_output":
+				return true
 			}
 		}
 	}
 
-	return ""
+	return false
 }
 
 // detectVisionContent checks if the request body contains vision/image content.
@@ -572,12 +692,110 @@ func (e *GitHubCopilotExecutor) normalizeModel(model string, body []byte) []byte
 	return body
 }
 
+// copilotUnsupportedBetas lists beta headers that are Anthropic-specific and
+// must not be forwarded to GitHub Copilot. The context-1m beta enables 1M
+// context on Anthropic's API, but Copilot's Claude models are limited to
+// ~128K-200K. Passing it through would not enable 1M on Copilot, but stripping
+// it from the translated body avoids confusing downstream translators.
+var copilotUnsupportedBetas = []string{
+	"context-1m-2025-08-07",
+}
+
+// stripUnsupportedBetas removes Anthropic-specific beta entries from the
+// translated request body. In OpenAI format the betas may appear under
+// "metadata.betas" or a top-level "betas" array; in Claude format they sit at
+// "betas". This function checks all known locations.
+func stripUnsupportedBetas(body []byte) []byte {
+	betaPaths := []string{"betas", "metadata.betas"}
+	for _, path := range betaPaths {
+		arr := gjson.GetBytes(body, path)
+		if !arr.Exists() || !arr.IsArray() {
+			continue
+		}
+		var filtered []string
+		changed := false
+		for _, item := range arr.Array() {
+			beta := item.String()
+			if isCopilotUnsupportedBeta(beta) {
+				changed = true
+				continue
+			}
+			filtered = append(filtered, beta)
+		}
+		if !changed {
+			continue
+		}
+		if len(filtered) == 0 {
+			body, _ = sjson.DeleteBytes(body, path)
+		} else {
+			body, _ = sjson.SetBytes(body, path, filtered)
+		}
+	}
+	return body
+}
+
+func isCopilotUnsupportedBeta(beta string) bool {
+	return slices.Contains(copilotUnsupportedBetas, beta)
+}
+
+// normalizeGitHubCopilotReasoningField maps Copilot's non-standard
+// 'reasoning_text' field to the standard OpenAI 'reasoning_content' field
+// that the SDK translator expects. This handles both streaming deltas
+// (choices[].delta.reasoning_text) and non-streaming messages
+// (choices[].message.reasoning_text). The field is only renamed when
+// 'reasoning_content' is absent or null, preserving standard responses.
+// All choices are processed to support n>1 requests.
+func normalizeGitHubCopilotReasoningField(data []byte) []byte {
+	choices := gjson.GetBytes(data, "choices")
+	if !choices.Exists() || !choices.IsArray() {
+		return data
+	}
+	for i := range choices.Array() {
+		// Non-streaming: choices[i].message.reasoning_text
+		msgRT := fmt.Sprintf("choices.%d.message.reasoning_text", i)
+		msgRC := fmt.Sprintf("choices.%d.message.reasoning_content", i)
+		if rt := gjson.GetBytes(data, msgRT); rt.Exists() && rt.String() != "" {
+			if rc := gjson.GetBytes(data, msgRC); !rc.Exists() || rc.Type == gjson.Null || rc.String() == "" {
+				data, _ = sjson.SetBytes(data, msgRC, rt.String())
+			}
+		}
+		// Streaming: choices[i].delta.reasoning_text
+		deltaRT := fmt.Sprintf("choices.%d.delta.reasoning_text", i)
+		deltaRC := fmt.Sprintf("choices.%d.delta.reasoning_content", i)
+		if rt := gjson.GetBytes(data, deltaRT); rt.Exists() && rt.String() != "" {
+			if rc := gjson.GetBytes(data, deltaRC); !rc.Exists() || rc.Type == gjson.Null || rc.String() == "" {
+				data, _ = sjson.SetBytes(data, deltaRC, rt.String())
+			}
+		}
+	}
+	return data
+}
+
 func useGitHubCopilotResponsesEndpoint(sourceFormat sdktranslator.Format, model string) bool {
 	if sourceFormat.String() == "openai-response" {
 		return true
 	}
 	baseModel := strings.ToLower(thinking.ParseSuffix(model).ModelName)
+	if info := registry.GetGlobalRegistry().GetModelInfo(baseModel, githubCopilotAuthType); info != nil {
+		return len(info.SupportedEndpoints) > 0 && !containsEndpoint(info.SupportedEndpoints, githubCopilotChatPath) && containsEndpoint(info.SupportedEndpoints, githubCopilotResponsesPath)
+	}
+	if info := lookupGitHubCopilotStaticModelInfo(baseModel); info != nil {
+		return len(info.SupportedEndpoints) > 0 && !containsEndpoint(info.SupportedEndpoints, githubCopilotChatPath) && containsEndpoint(info.SupportedEndpoints, githubCopilotResponsesPath)
+	}
 	return strings.Contains(baseModel, "codex")
+}
+
+func lookupGitHubCopilotStaticModelInfo(model string) *registry.ModelInfo {
+	for _, info := range registry.GetStaticModelDefinitionsByChannel(githubCopilotAuthType) {
+		if info != nil && strings.EqualFold(info.ID, model) {
+			return info
+		}
+	}
+	return nil
+}
+
+func containsEndpoint(endpoints []string, endpoint string) bool {
+	return slices.Contains(endpoints, endpoint)
 }
 
 // flattenAssistantContent converts assistant message content from array format
@@ -832,6 +1050,32 @@ func stripGitHubCopilotResponsesUnsupportedFields(body []byte) []byte {
 	return body
 }
 
+// applyGitHubCopilotResponsesDefaults sets required fields for the Responses API
+// that both vscode-copilot-chat and pi-ai always include.
+//
+// References:
+//   - vscode-copilot-chat: src/platform/endpoint/node/responsesApi.ts
+//   - pi-ai (badlogic/pi-mono): packages/ai/src/providers/openai-responses.ts
+func applyGitHubCopilotResponsesDefaults(body []byte) []byte {
+	// store: false — prevents request/response storage
+	if !gjson.GetBytes(body, "store").Exists() {
+		body, _ = sjson.SetBytes(body, "store", false)
+	}
+
+	// include: ["reasoning.encrypted_content"] — enables reasoning content
+	// reuse across turns, avoiding redundant computation
+	if !gjson.GetBytes(body, "include").Exists() {
+		body, _ = sjson.SetRawBytes(body, "include", []byte(`["reasoning.encrypted_content"]`))
+	}
+
+	// If reasoning.effort is set but reasoning.summary is not, default to "auto"
+	if gjson.GetBytes(body, "reasoning.effort").Exists() && !gjson.GetBytes(body, "reasoning.summary").Exists() {
+		body, _ = sjson.SetBytes(body, "reasoning.summary", "auto")
+	}
+
+	return body
+}
+
 func normalizeGitHubCopilotResponsesTools(body []byte) []byte {
 	tools := gjson.GetBytes(body, "tools")
 	if tools.Exists() {
@@ -977,7 +1221,7 @@ type githubCopilotResponsesStreamState struct {
 	ItemIDToTool      map[string]*githubCopilotResponsesStreamToolState
 }
 
-func translateGitHubCopilotResponsesNonStreamToClaude(data []byte) string {
+func translateGitHubCopilotResponsesNonStreamToClaude(data []byte) []byte {
 	root := gjson.ParseBytes(data)
 	out := `{"id":"","type":"message","role":"assistant","model":"","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}`
 	out, _ = sjson.Set(out, "id", root.Get("id").String())
@@ -1067,10 +1311,10 @@ func translateGitHubCopilotResponsesNonStreamToClaude(data []byte) string {
 	} else {
 		out, _ = sjson.Set(out, "stop_reason", "end_turn")
 	}
-	return out
+	return []byte(out)
 }
 
-func translateGitHubCopilotResponsesStreamToClaude(line []byte, param *any) []string {
+func translateGitHubCopilotResponsesStreamToClaude(line []byte, param *any) [][]byte {
 	if *param == nil {
 		*param = &githubCopilotResponsesStreamState{
 			TextBlockIndex:    -1,
@@ -1092,7 +1336,10 @@ func translateGitHubCopilotResponsesStreamToClaude(line []byte, param *any) []st
 	}
 
 	event := gjson.GetBytes(payload, "type").String()
-	results := make([]string, 0, 4)
+	results := make([][]byte, 0, 4)
+	appendResult := func(chunk string) {
+		results = append(results, []byte(chunk))
+	}
 	ensureMessageStart := func() {
 		if state.MessageStarted {
 			return
@@ -1100,7 +1347,7 @@ func translateGitHubCopilotResponsesStreamToClaude(line []byte, param *any) []st
 		messageStart := `{"type":"message_start","message":{"id":"","type":"message","role":"assistant","model":"","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}}`
 		messageStart, _ = sjson.Set(messageStart, "message.id", gjson.GetBytes(payload, "response.id").String())
 		messageStart, _ = sjson.Set(messageStart, "message.model", gjson.GetBytes(payload, "response.model").String())
-		results = append(results, "event: message_start\ndata: "+messageStart+"\n\n")
+		appendResult("event: message_start\ndata: " + messageStart + "\n\n")
 		state.MessageStarted = true
 	}
 	startTextBlockIfNeeded := func() {
@@ -1113,7 +1360,7 @@ func translateGitHubCopilotResponsesStreamToClaude(line []byte, param *any) []st
 		}
 		contentBlockStart := `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`
 		contentBlockStart, _ = sjson.Set(contentBlockStart, "index", state.TextBlockIndex)
-		results = append(results, "event: content_block_start\ndata: "+contentBlockStart+"\n\n")
+		appendResult("event: content_block_start\ndata: " + contentBlockStart + "\n\n")
 		state.TextBlockStarted = true
 	}
 	stopTextBlockIfNeeded := func() {
@@ -1122,7 +1369,7 @@ func translateGitHubCopilotResponsesStreamToClaude(line []byte, param *any) []st
 		}
 		contentBlockStop := `{"type":"content_block_stop","index":0}`
 		contentBlockStop, _ = sjson.Set(contentBlockStop, "index", state.TextBlockIndex)
-		results = append(results, "event: content_block_stop\ndata: "+contentBlockStop+"\n\n")
+		appendResult("event: content_block_stop\ndata: " + contentBlockStop + "\n\n")
 		state.TextBlockStarted = false
 		state.TextBlockIndex = -1
 	}
@@ -1152,7 +1399,7 @@ func translateGitHubCopilotResponsesStreamToClaude(line []byte, param *any) []st
 			contentDelta := `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}}`
 			contentDelta, _ = sjson.Set(contentDelta, "index", state.TextBlockIndex)
 			contentDelta, _ = sjson.Set(contentDelta, "delta.text", delta)
-			results = append(results, "event: content_block_delta\ndata: "+contentDelta+"\n\n")
+			appendResult("event: content_block_delta\ndata: " + contentDelta + "\n\n")
 		}
 	case "response.reasoning_summary_part.added":
 		ensureMessageStart()
@@ -1161,7 +1408,7 @@ func translateGitHubCopilotResponsesStreamToClaude(line []byte, param *any) []st
 		state.NextContentIndex++
 		thinkingStart := `{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`
 		thinkingStart, _ = sjson.Set(thinkingStart, "index", state.ReasoningIndex)
-		results = append(results, "event: content_block_start\ndata: "+thinkingStart+"\n\n")
+		appendResult("event: content_block_start\ndata: " + thinkingStart + "\n\n")
 	case "response.reasoning_summary_text.delta":
 		if state.ReasoningActive {
 			delta := gjson.GetBytes(payload, "delta").String()
@@ -1169,14 +1416,14 @@ func translateGitHubCopilotResponsesStreamToClaude(line []byte, param *any) []st
 				thinkingDelta := `{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}`
 				thinkingDelta, _ = sjson.Set(thinkingDelta, "index", state.ReasoningIndex)
 				thinkingDelta, _ = sjson.Set(thinkingDelta, "delta.thinking", delta)
-				results = append(results, "event: content_block_delta\ndata: "+thinkingDelta+"\n\n")
+				appendResult("event: content_block_delta\ndata: " + thinkingDelta + "\n\n")
 			}
 		}
 	case "response.reasoning_summary_part.done":
 		if state.ReasoningActive {
 			thinkingStop := `{"type":"content_block_stop","index":0}`
 			thinkingStop, _ = sjson.Set(thinkingStop, "index", state.ReasoningIndex)
-			results = append(results, "event: content_block_stop\ndata: "+thinkingStop+"\n\n")
+			appendResult("event: content_block_stop\ndata: " + thinkingStop + "\n\n")
 			state.ReasoningActive = false
 		}
 	case "response.output_item.added":
@@ -1204,7 +1451,7 @@ func translateGitHubCopilotResponsesStreamToClaude(line []byte, param *any) []st
 		contentBlockStart, _ = sjson.Set(contentBlockStart, "index", tool.Index)
 		contentBlockStart, _ = sjson.Set(contentBlockStart, "content_block.id", tool.ID)
 		contentBlockStart, _ = sjson.Set(contentBlockStart, "content_block.name", tool.Name)
-		results = append(results, "event: content_block_start\ndata: "+contentBlockStart+"\n\n")
+		appendResult("event: content_block_start\ndata: " + contentBlockStart + "\n\n")
 	case "response.output_item.delta":
 		item := gjson.GetBytes(payload, "item")
 		if item.Get("type").String() != "function_call" {
@@ -1224,7 +1471,7 @@ func translateGitHubCopilotResponsesStreamToClaude(line []byte, param *any) []st
 		inputDelta := `{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}`
 		inputDelta, _ = sjson.Set(inputDelta, "index", tool.Index)
 		inputDelta, _ = sjson.Set(inputDelta, "delta.partial_json", partial)
-		results = append(results, "event: content_block_delta\ndata: "+inputDelta+"\n\n")
+		appendResult("event: content_block_delta\ndata: " + inputDelta + "\n\n")
 	case "response.function_call_arguments.delta":
 		// Copilot sends tool call arguments via this event type (not response.output_item.delta).
 		// Data format: {"delta":"...", "item_id":"...", "output_index":N, ...}
@@ -1241,7 +1488,7 @@ func translateGitHubCopilotResponsesStreamToClaude(line []byte, param *any) []st
 		inputDelta := `{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}`
 		inputDelta, _ = sjson.Set(inputDelta, "index", tool.Index)
 		inputDelta, _ = sjson.Set(inputDelta, "delta.partial_json", partial)
-		results = append(results, "event: content_block_delta\ndata: "+inputDelta+"\n\n")
+		appendResult("event: content_block_delta\ndata: " + inputDelta + "\n\n")
 	case "response.output_item.done":
 		if gjson.GetBytes(payload, "item.type").String() != "function_call" {
 			break
@@ -1252,7 +1499,7 @@ func translateGitHubCopilotResponsesStreamToClaude(line []byte, param *any) []st
 		}
 		contentBlockStop := `{"type":"content_block_stop","index":0}`
 		contentBlockStop, _ = sjson.Set(contentBlockStop, "index", tool.Index)
-		results = append(results, "event: content_block_stop\ndata: "+contentBlockStop+"\n\n")
+		appendResult("event: content_block_stop\ndata: " + contentBlockStop + "\n\n")
 	case "response.completed":
 		ensureMessageStart()
 		stopTextBlockIfNeeded()
@@ -1276,8 +1523,8 @@ func translateGitHubCopilotResponsesStreamToClaude(line []byte, param *any) []st
 			if cachedTokens > 0 {
 				messageDelta, _ = sjson.Set(messageDelta, "usage.cache_read_input_tokens", cachedTokens)
 			}
-			results = append(results, "event: message_delta\ndata: "+messageDelta+"\n\n")
-			results = append(results, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+			appendResult("event: message_delta\ndata: " + messageDelta + "\n\n")
+			appendResult("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
 			state.MessageStopSent = true
 		}
 	}
@@ -1377,6 +1624,21 @@ func FetchGitHubCopilotModels(ctx context.Context, auth *cliproxyauth.Auth, cfg 
 			m.Description = entry.ID + " via GitHub Copilot"
 			m.ContextLength = defaultCopilotContextLength
 			m.MaxCompletionTokens = defaultCopilotMaxCompletionTokens
+		}
+
+		// Override with real limits from the Copilot API when available.
+		// The API returns per-account limits (individual vs business) under
+		// capabilities.limits, which are more accurate than our static
+		// fallback values. We use max_prompt_tokens as ContextLength because
+		// that's the hard limit the Copilot API enforces on prompt size —
+		// exceeding it triggers "prompt token count exceeds the limit" errors.
+		if limits := entry.Limits(); limits != nil {
+			if limits.MaxPromptTokens > 0 {
+				m.ContextLength = limits.MaxPromptTokens
+			}
+			if limits.MaxOutputTokens > 0 {
+				m.MaxCompletionTokens = limits.MaxOutputTokens
+			}
 		}
 
 		models = append(models, m)
