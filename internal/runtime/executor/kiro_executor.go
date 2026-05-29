@@ -250,7 +250,7 @@ func getKiroPooledHTTPClient() *http.Client {
 			MaxIdleConns:        100,
 			MaxIdleConnsPerHost: 20,
 			MaxConnsPerHost:     50,
-			IdleConnTimeout:     50 * time.Second,
+			IdleConnTimeout:     20 * time.Second,
 
 			DialContext: (&net.Dialer{
 				Timeout:   30 * time.Second,
@@ -263,12 +263,13 @@ func getKiroPooledHTTPClient() *http.Client {
 			ForceAttemptHTTP2:     true,
 		}
 
-		// HTTP/2 PING 探活：空闲 30s 发 PING，15s 没回则废弃连接
+		// HTTP/2 PING 探活：空闲 10s 发 PING，5s 没回则废弃连接，
+		// 必须在 ResponseHeaderTimeout (30s) 之前完成探活才能生效
 		if h2, err := http2.ConfigureTransports(transport); err != nil {
 			log.Warnf("kiro: failed to configure HTTP/2 transport: %v", err)
 		} else {
-			h2.ReadIdleTimeout = 30 * time.Second
-			h2.PingTimeout = 15 * time.Second
+			h2.ReadIdleTimeout = 10 * time.Second
+			h2.PingTimeout = 5 * time.Second
 		}
 
 		kiroHTTPClientPool = &http.Client{
