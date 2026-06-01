@@ -262,6 +262,19 @@ func BuildKiroPayload(claudeBody []byte, modelID, profileArn, origin string, isA
 	// Process messages and build history
 	history, currentUserMsg, currentToolResults := processMessages(messages, modelID, origin)
 
+	// Kiro rejects requests whose currentMessage is only a system-prompt wrapper
+	// with empty history ("Improperly formed request"). When the upstream Claude
+	// request has no messages but carries a system field, synthesize a placeholder
+	// user message so the normal path below wraps systemPrompt into a real user turn.
+	if currentUserMsg == nil && len(history) == 0 {
+		currentUserMsg = &KiroUserInputMessage{
+			Content: kirocommon.DefaultUserContent,
+			ModelID: modelID,
+			Origin:  origin,
+		}
+		log.Infof("kiro: messages array empty, synthesized placeholder user message")
+	}
+
 	// Build content with system prompt.
 	// Keep thinking tags on subsequent turns so multi-turn Claude sessions
 	// continue to emit reasoning events.
