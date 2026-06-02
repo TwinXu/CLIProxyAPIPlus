@@ -738,6 +738,25 @@ func processMessages(messages gjson.Result, modelID, origin string) ([]KiroHisto
 		}
 	}
 
+	// If the trailing incoming message has a role other than user/assistant
+	// (e.g. a stray tool/system message, or an empty-role entry), the loop above
+	// skips it and leaves currentUserMsg nil. When history already ends with a
+	// user turn, falling through to the system-prompt-only fallback would emit
+	// two consecutive user turns, which Kiro rejects as "Improperly formed
+	// request". Promote the trailing history user message to be the currentMessage
+	// so history ends with an assistant turn and alternation stays valid.
+	if currentUserMsg == nil && len(history) > 0 {
+		last := history[len(history)-1]
+		if last.UserInputMessage != nil {
+			history = history[:len(history)-1]
+			currentUserMsg = last.UserInputMessage
+			if last.UserInputMessage.UserInputMessageContext != nil {
+				currentToolResults = last.UserInputMessage.UserInputMessageContext.ToolResults
+				currentUserMsg.UserInputMessageContext = nil
+			}
+		}
+	}
+
 	// POST-PROCESSING: Remove orphaned tool_results that have no matching tool_use
 	// in any assistant message. This happens when Claude Code compaction truncates
 	// the conversation and removes the assistant message containing the tool_use,
