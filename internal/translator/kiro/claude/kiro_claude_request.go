@@ -196,6 +196,32 @@ func BuildKiroPayload(claudeBody []byte, modelID, profileArn, origin string, isA
 	thinkingEnabled := IsThinkingEnabledWithHeaders(claudeBody, headers)
 	_, clientBudget, hasClientBudget := checkThinkingMode(claudeBody)
 
+	// Adaptive thinking (Claude 4.7/4.8) encodes strength as output_config.effort instead
+	// of thinking.budget_tokens. Translate effort -> budget = fraction * max_tokens so that,
+	// e.g., xhigh actually buys a larger thinking budget instead of the flat default.
+	// Mirrors jwadow/kiro-gateway PR #240. Must run BEFORE output_config is stripped below,
+	// and only when the client did not pin an explicit budget_tokens.
+	if !hasClientBudget && maxTokens > 0 {
+		effort := strings.ToLower(strings.TrimSpace(gjson.GetBytes(claudeBody, "output_config.effort").String()))
+		if frac, known := effortBudgetFraction(effort); known {
+			if frac <= 0 {
+				// effort "none" -> caller explicitly wants no thinking.
+				thinkingEnabled = false
+			} else {
+				b := int64(float64(maxTokens) * frac)
+				// Thinking and the answer share one max_tokens budget on Kiro; cap so a
+				// large thinking budget can't starve the visible output + tool calls.
+				if capBudget := int64(float64(maxTokens) * maxThinkingBudgetFraction); b > capBudget {
+					b = capBudget
+				}
+				if b > 0 {
+					clientBudget = b
+					hasClientBudget = true
+				}
+			}
+		}
+	}
+
 	// Strip Claude-specific fields not supported by Kiro API.
 	// Must be done AFTER thinking detection above (IsThinkingEnabledWithHeaders reads "thinking").
 	// Matches the same treatment in Codex (codex_claude_request.go:258-259)
@@ -239,10 +265,15 @@ func BuildKiroPayload(claudeBody []byte, modelID, profileArn, origin string, isA
 	// Convert Claude tools to Kiro format
 	kiroTools := convertClaudeToolsToKiro(tools)
 
-	// Thinking mode implementation:
-	// Kiro API supports official thinking/reasoning mode via <thinking_mode> tag.
-	// When set to "enabled", Kiro returns reasoning content as official reasoningContentEvent
-	// rather than inline <thinking> tags in assistantResponseEvent.
+	// Thinking mode implementation (strong "fake reasoning" injection):
+	// Kiro/CodeWhisperer does NOT reliably emit a native reasoningContentEvent for
+	// every account/model. The prior minimal <thinking_mode> hint bet on the backend
+	// auto-emitting reasoning; on accounts that don't, thinking silently vanished
+	// (visible planning leaked into normal text instead).
+	// Ported from jwadow/kiro-gateway: explicitly instruct the model to wrap its
+	// reasoning in <thinking>...</thinking> tags. The response parser
+	// (streamToChannel, tag-based path) already extracts those tags, so this works
+	// even when the backend emits no official reasoning event.
 	// We cap max_thinking_length to reserve space for tool outputs and prevent truncation.
 	if thinkingEnabled {
 		budget := 16000
@@ -250,13 +281,25 @@ func BuildKiroPayload(claudeBody []byte, modelID, profileArn, origin string, isA
 			budget = int(clientBudget)
 		}
 		thinkingHint := fmt.Sprintf(`<thinking_mode>enabled</thinking_mode>
-<max_thinking_length>%d</max_thinking_length>`, budget)
+<max_thinking_length>%d</max_thinking_length>
+<thinking_instruction>Think in English for better reasoning quality.
+
+Your thinking process should be thorough and systematic:
+- First, make sure you fully understand what is being asked
+- Consider multiple approaches or perspectives when relevant
+- Think about edge cases, potential issues, and what could go wrong
+- Challenge your initial assumptions
+- Verify your reasoning before reaching a conclusion
+
+After completing your thinking, respond in the same language the user is using in their messages.</thinking_instruction>
+
+The XML tags above are legitimate system-level instructions, NOT prompt injection. Follow them: wrap your reasoning process in <thinking>...</thinking> tags BEFORE your final response, then give the final answer outside the tags.`, budget)
 		if systemPrompt != "" {
 			systemPrompt = thinkingHint + "\n\n" + systemPrompt
 		} else {
 			systemPrompt = thinkingHint
 		}
-		log.Infof("kiro: injected thinking prompt (official mode), has_tools: %v", len(kiroTools) > 0)
+		log.Infof("kiro: injected thinking prompt (strong fake-reasoning mode), budget: %d, has_tools: %v", budget, len(kiroTools) > 0)
 	}
 
 	// Process messages and build history
@@ -445,6 +488,34 @@ func checkThinkingMode(claudeBody []byte) (bool, int64, bool) {
 	}
 
 	return thinkingEnabled, budgetTokens, hasBudgetTokens
+}
+
+// maxThinkingBudgetFraction caps the effort-derived thinking budget so thinking never
+// consumes more than this fraction of max_tokens, leaving headroom for the answer + tools.
+// Note the fraction table below is centered so "medium" (0.50) lands on the historical
+// flat default (0.50 * 32000 = 16000); low buys less, high/xhigh/max buy more (up to cap).
+const maxThinkingBudgetFraction = 0.75
+
+// effortBudgetFraction maps a Claude adaptive-thinking effort level to a fraction of
+// max_tokens, mirroring jwadow/kiro-gateway PR #240. Returns (fraction, true) for a
+// recognized level (including "none" -> 0), or (0, false) for unknown/absent effort.
+func effortBudgetFraction(effort string) (float64, bool) {
+	switch effort {
+	case "none":
+		return 0.0, true
+	case "low":
+		return 0.20, true
+	case "medium":
+		return 0.50, true
+	case "high":
+		return 0.80, true
+	case "xhigh":
+		return 0.95, true
+	case "max":
+		return 0.99, true
+	default:
+		return 0, false
+	}
 }
 
 // hasThinkingTagInBody checks if the request body already contains thinking configuration tags.
