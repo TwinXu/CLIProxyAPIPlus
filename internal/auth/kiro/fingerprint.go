@@ -252,6 +252,23 @@ func (fp *Fingerprint) BuildAmzUserAgent() string {
 	)
 }
 
+// WithVersions returns a shallow copy of the fingerprint with KiroVersion and/or
+// StreamingSDKVersion overridden; empty arguments leave the existing value intact.
+// Used to pair a specific endpoint with a client version (e.g. the modern
+// runtime.*.kiro.dev endpoint only accepts current Kiro IDE 0.12.x / SDK 1.0.39)
+// without disturbing the account's default fingerprint used on the legacy
+// q.*.amazonaws.com endpoint.
+func (fp *Fingerprint) WithVersions(kiroVersion, streamingSDK string) *Fingerprint {
+	cp := *fp
+	if kiroVersion != "" {
+		cp.KiroVersion = kiroVersion
+	}
+	if streamingSDK != "" {
+		cp.StreamingSDKVersion = streamingSDK
+	}
+	return &cp
+}
+
 func SetOIDCHeaders(req *http.Request) {
 	fp := GlobalFingerprintManager().GetFingerprint("oidc-session")
 	req.Header.Set("Content-Type", "application/json")

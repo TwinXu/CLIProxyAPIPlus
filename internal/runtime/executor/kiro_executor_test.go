@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -59,8 +60,8 @@ func TestBuildKiroEndpointConfigs(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			configs := buildKiroEndpointConfigs(tt.region)
 
-			if len(configs) != 2 {
-				t.Fatalf("expected 2 endpoint configs, got %d", len(configs))
+			if len(configs) != 3 {
+				t.Fatalf("expected 3 endpoint configs, got %d", len(configs))
 			}
 
 			// Check primary endpoint (AmazonQ)
@@ -95,6 +96,29 @@ func TestBuildKiroEndpointConfigs(t *testing.T) {
 			if fallback.AmzTarget == "" {
 				t.Error("fallback AmzTarget should NOT be empty")
 			}
+
+			// Check modern Kiro runtime endpoint (last; opt-in via preferred_endpoint).
+			runtimeCfg := configs[2]
+			if runtimeCfg.Name != "KiroRuntime" {
+				t.Errorf("runtime Name = %q, want %q", runtimeCfg.Name, "KiroRuntime")
+			}
+			expectedRuntimeURL := fmt.Sprintf("https://runtime.%s.kiro.dev/generateAssistantResponse", expectedRegion)
+			if runtimeCfg.URL != expectedRuntimeURL {
+				t.Errorf("runtime URL = %q, want %q", runtimeCfg.URL, expectedRuntimeURL)
+			}
+			if runtimeCfg.Origin != "AI_EDITOR" {
+				t.Errorf("runtime Origin = %q, want AI_EDITOR", runtimeCfg.Origin)
+			}
+			if runtimeCfg.AmzTarget != "" {
+				t.Errorf("runtime AmzTarget should be empty, got %q", runtimeCfg.AmzTarget)
+			}
+			// Modern endpoint must pin the current Kiro IDE client version.
+			if runtimeCfg.KiroVersion != "0.12.333" {
+				t.Errorf("runtime KiroVersion = %q, want 0.12.333", runtimeCfg.KiroVersion)
+			}
+			if runtimeCfg.StreamingSDKVersion != "1.0.39" {
+				t.Errorf("runtime StreamingSDKVersion = %q, want 1.0.39", runtimeCfg.StreamingSDKVersion)
+			}
 		})
 	}
 }
@@ -102,8 +126,8 @@ func TestBuildKiroEndpointConfigs(t *testing.T) {
 func TestGetKiroEndpointConfigs_NilAuth(t *testing.T) {
 	configs := getKiroEndpointConfigs(nil)
 
-	if len(configs) != 2 {
-		t.Fatalf("expected 2 endpoint configs, got %d", len(configs))
+	if len(configs) != 3 {
+		t.Fatalf("expected 3 endpoint configs, got %d", len(configs))
 	}
 
 	// Should return default us-east-1 configs
@@ -125,8 +149,8 @@ func TestGetKiroEndpointConfigs_WithRegionFromProfileArn(t *testing.T) {
 
 	configs := getKiroEndpointConfigs(auth)
 
-	if len(configs) != 2 {
-		t.Fatalf("expected 2 endpoint configs, got %d", len(configs))
+	if len(configs) != 3 {
+		t.Fatalf("expected 3 endpoint configs, got %d", len(configs))
 	}
 
 	expectedURL := "https://q.ap-southeast-1.amazonaws.com/generateAssistantResponse"
@@ -182,6 +206,16 @@ func TestGetKiroEndpointConfigs_PreferredEndpoint(t *testing.T) {
 			name:              "Prefer cli (alias for amazonq)",
 			preference:        "cli",
 			expectedFirstName: "AmazonQ",
+		},
+		{
+			name:              "Prefer runtime (modern Kiro IDE endpoint)",
+			preference:        "runtime",
+			expectedFirstName: "KiroRuntime",
+		},
+		{
+			name:              "Prefer kiro (alias for kiroruntime)",
+			preference:        "kiro",
+			expectedFirstName: "KiroRuntime",
 		},
 		{
 			name:              "Unknown preference - no reordering",
@@ -1417,6 +1451,41 @@ func TestGetAccountKey(t *testing.T) {
 	}
 }
 
+func TestApplyDynamicFingerprintForEndpoint_VersionPairing(t *testing.T) {
+	auth := &cliproxyauth.Auth{Metadata: map[string]any{"client_id": "test-account-version-pairing"}}
+
+	// Legacy/zero-value endpoint -> account default version (pool is 0.8.x-0.10.x,
+	// never the pinned 0.12.333), keeping legacy requests byte-identical.
+	reqLegacy, _ := http.NewRequest(http.MethodPost, "https://q.us-east-1.amazonaws.com/generateAssistantResponse", nil)
+	applyDynamicFingerprintForEndpoint(reqLegacy, auth, kiroEndpointConfig{})
+	legacyUA := reqLegacy.Header.Get("X-Amz-User-Agent")
+	if strings.Contains(legacyUA, "KiroIDE-0.12.333") {
+		t.Errorf("legacy endpoint must not use pinned 0.12.333, got %q", legacyUA)
+	}
+
+	// Modern runtime endpoint -> pinned 0.12.333 / SDK 1.0.39 (matches today's Kiro IDE).
+	runtimeEP := kiroEndpointConfig{Name: "KiroRuntime", KiroVersion: "0.12.333", StreamingSDKVersion: "1.0.39"}
+	reqRuntime, _ := http.NewRequest(http.MethodPost, "https://runtime.us-east-1.kiro.dev/generateAssistantResponse", nil)
+	applyDynamicFingerprintForEndpoint(reqRuntime, auth, runtimeEP)
+	amzUA := reqRuntime.Header.Get("X-Amz-User-Agent")
+	ua := reqRuntime.Header.Get("User-Agent")
+	if !strings.Contains(amzUA, "aws-sdk-js/1.0.39") || !strings.Contains(amzUA, "KiroIDE-0.12.333-") {
+		t.Errorf("runtime X-Amz-User-Agent = %q, want aws-sdk-js/1.0.39 + KiroIDE-0.12.333-", amzUA)
+	}
+	if !strings.Contains(ua, "codewhispererstreaming#1.0.39") || !strings.Contains(ua, "KiroIDE-0.12.333-") {
+		t.Errorf("runtime User-Agent = %q, want codewhispererstreaming#1.0.39 + KiroIDE-0.12.333-", ua)
+	}
+
+	// Critical: the per-endpoint override must NOT mutate the cached account fingerprint
+	// (GetFingerprint returns a shared pointer; WithVersions must copy). A second legacy
+	// call must still yield the account-default version, unchanged.
+	reqLegacy2, _ := http.NewRequest(http.MethodPost, "https://q.us-east-1.amazonaws.com/generateAssistantResponse", nil)
+	applyDynamicFingerprintForEndpoint(reqLegacy2, auth, kiroEndpointConfig{})
+	if got := reqLegacy2.Header.Get("X-Amz-User-Agent"); got != legacyUA {
+		t.Errorf("endpoint override mutated cached account fingerprint: %q != %q", got, legacyUA)
+	}
+}
+
 func TestEndpointAliases(t *testing.T) {
 	// Verify all expected aliases are defined
 	expectedAliases := map[string]string{
@@ -1425,6 +1494,10 @@ func TestEndpointAliases(t *testing.T) {
 		"amazonq":       "amazonq",
 		"q":             "amazonq",
 		"cli":           "amazonq",
+		"kiroruntime":   "kiroruntime",
+		"runtime":       "kiroruntime",
+		"kiro":          "kiroruntime",
+		"kirodev":       "kiroruntime",
 	}
 
 	for alias, target := range expectedAliases {

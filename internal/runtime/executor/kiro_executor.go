@@ -89,6 +89,11 @@ var endpointAliases = map[string]string{
 	"amazonq":       "amazonq",
 	"q":             "amazonq",
 	"cli":           "amazonq",
+	// Modern Kiro IDE runtime endpoint (runtime.*.kiro.dev). Opt-in per account.
+	"kiroruntime": "kiroruntime",
+	"runtime":     "kiroruntime",
+	"kiro":        "kiroruntime",
+	"kirodev":     "kiroruntime",
 }
 
 func enqueueTranslatedSSE(out chan<- cliproxyexecutor.StreamChunk, chunk []byte) {
@@ -327,6 +332,13 @@ type kiroEndpointConfig struct {
 	Origin    string // Request Origin: "CLI" for Amazon Q quota, "AI_EDITOR" for Kiro IDE quota
 	AmzTarget string // X-Amz-Target header value
 	Name      string // Endpoint name for logging
+	// KiroVersion/StreamingSDKVersion pin the client fingerprint for this endpoint.
+	// Empty = use the account's default (legacy) fingerprint. The modern
+	// runtime.*.kiro.dev endpoint only accepts current Kiro IDE versions, so it pins
+	// 0.12.x / SDK 1.0.39; the legacy q.*.amazonaws.com endpoint leaves these empty to
+	// stay byte-identical to the proven-working request.
+	KiroVersion         string
+	StreamingSDKVersion string
 }
 
 // kiroDefaultRegion is the default AWS region for Kiro API endpoints.
@@ -375,6 +387,22 @@ func buildKiroEndpointConfigs(region string) []kiroEndpointConfig {
 			Origin:    "AI_EDITOR",
 			AmzTarget: "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
 			Name:      "CodeWhisperer",
+		},
+		{
+			// Modern Kiro IDE runtime endpoint (as used by Kiro IDE 0.12.x).
+			// Listed last so it is NEVER reached by default (the Q endpoint above
+			// succeeds first). Opt-in per account via preferred_endpoint=runtime,
+			// which reorders it first. It is intentionally NOT the global default:
+			// a 403 here does NOT fall through to other endpoints (see the 403 handler),
+			// so a bad rollout would break traffic instead of falling back.
+			// Pins 0.12.333 / SDK 1.0.39 to match today's Kiro IDE
+			// (verified: same token + body -> 200 + reasoningContentEvent).
+			URL:                 fmt.Sprintf("https://runtime.%s.kiro.dev/generateAssistantResponse", region),
+			Origin:              "AI_EDITOR",
+			AmzTarget:           "",
+			Name:                "KiroRuntime",
+			KiroVersion:         "0.12.333",
+			StreamingSDKVersion: "1.0.39",
 		},
 	}
 }
@@ -493,10 +521,24 @@ func NewKiroExecutor(cfg *config.Config) *KiroExecutor {
 // Identifier returns the unique identifier for this executor.
 func (e *KiroExecutor) Identifier() string { return "kiro" }
 
-// applyDynamicFingerprint applies account-specific fingerprint headers to the request.
+// applyDynamicFingerprint applies account-specific fingerprint headers to the request,
+// using the account's default (legacy) client version. See applyDynamicFingerprintForEndpoint
+// for the endpoint-version-paired variant used inside the endpoint failover loops.
 func applyDynamicFingerprint(req *http.Request, auth *cliproxyauth.Auth) {
+	applyDynamicFingerprintForEndpoint(req, auth, kiroEndpointConfig{})
+}
+
+// applyDynamicFingerprintForEndpoint applies account-specific fingerprint headers,
+// optionally pinning the Kiro IDE / streaming-SDK version to match the target endpoint
+// (kiroEndpointConfig.KiroVersion / StreamingSDKVersion). An empty endpoint (zero value)
+// leaves the account's default fingerprint untouched, keeping legacy-endpoint requests
+// byte-identical to the proven-working shape.
+func applyDynamicFingerprintForEndpoint(req *http.Request, auth *cliproxyauth.Auth, ep kiroEndpointConfig) {
 	accountKey := getAccountKey(auth)
 	fp := kiroauth.GlobalFingerprintManager().GetFingerprint(accountKey)
+	if ep.KiroVersion != "" || ep.StreamingSDKVersion != "" {
+		fp = fp.WithVersions(ep.KiroVersion, ep.StreamingSDKVersion)
+	}
 
 	req.Header.Set("User-Agent", fp.BuildUserAgent())
 	req.Header.Set("X-Amz-User-Agent", fp.BuildAmzUserAgent())
@@ -740,7 +782,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 			httpReq.Header.Set("x-amzn-codewhisperer-optout", "true")
 
 			// Apply dynamic fingerprint-based headers
-			applyDynamicFingerprint(httpReq, auth)
+			applyDynamicFingerprintForEndpoint(httpReq, auth, endpointConfig)
 
 			httpReq.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
 			httpReq.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
@@ -1201,7 +1243,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 			httpReq.Header.Set("x-amzn-codewhisperer-optout", "true")
 
 			// Apply dynamic fingerprint-based headers
-			applyDynamicFingerprint(httpReq, auth)
+			applyDynamicFingerprintForEndpoint(httpReq, auth, endpointConfig)
 
 			httpReq.Header.Set("Amz-Sdk-Request", "attempt=1; max=3")
 			httpReq.Header.Set("Amz-Sdk-Invocation-Id", uuid.New().String())
