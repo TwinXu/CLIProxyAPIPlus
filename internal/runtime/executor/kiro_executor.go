@@ -362,47 +362,44 @@ func extractRegionFromProfileARN(profileArn string) string {
 // buildKiroEndpointConfigs creates endpoint configurations for the specified region.
 // This enables dynamic region support for Enterprise/IdC users in non-us-east-1 regions.
 //
-// Uses Q endpoint (q.{region}.amazonaws.com) as primary for ALL auth types:
-// - Works universally across all AWS regions (CodeWhisperer endpoint only exists in us-east-1)
-// - Uses /generateAssistantResponse path with AI_EDITOR origin
-// - Does NOT require X-Amz-Target header
-//
-// The AmzTarget field is kept for backward compatibility but should be empty
-// to indicate that the header should NOT be set.
+// Uses the modern runtime.{region}.kiro.dev endpoint as primary (what today's Kiro IDE
+// 0.12.x talks to), with the legacy q.{region}.amazonaws.com and codewhisperer endpoints
+// as fallbacks. All three use /generateAssistantResponse with AI_EDITOR origin. The
+// runtime endpoint pins the current Kiro IDE client version (0.12.333 / SDK 1.0.39); the
+// legacy endpoints leave the version empty and use the account's default fingerprint.
+// AmzTarget is empty except for the legacy CodeWhisperer endpoint.
 func buildKiroEndpointConfigs(region string) []kiroEndpointConfig {
 	if region == "" {
 		region = kiroDefaultRegion
 	}
 	return []kiroEndpointConfig{
 		{
-			// Primary: Q endpoint - works for all regions and auth types
-			URL:       fmt.Sprintf("https://q.%s.amazonaws.com/generateAssistantResponse", region),
-			Origin:    "AI_EDITOR",
-			AmzTarget: "", // Empty = don't set X-Amz-Target header
-			Name:      "AmazonQ",
-		},
-		{
-			// Fallback: CodeWhisperer endpoint (legacy, only works in us-east-1)
-			URL:       fmt.Sprintf("https://codewhisperer.%s.amazonaws.com/generateAssistantResponse", region),
-			Origin:    "AI_EDITOR",
-			AmzTarget: "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
-			Name:      "CodeWhisperer",
-		},
-		{
-			// Modern Kiro IDE runtime endpoint (as used by Kiro IDE 0.12.x).
-			// Listed last so it is NEVER reached by default (the Q endpoint above
-			// succeeds first). Opt-in per account via preferred_endpoint=runtime,
-			// which reorders it first. It is intentionally NOT the global default:
-			// a 403 here does NOT fall through to other endpoints (see the 403 handler),
-			// so a bad rollout would break traffic instead of falling back.
-			// Pins 0.12.333 / SDK 1.0.39 to match today's Kiro IDE
-			// (verified: same token + body -> 200 + reasoningContentEvent).
+			// Primary: modern Kiro IDE runtime endpoint — this is what today's Kiro IDE
+			// (0.12.x) actually talks to. Pins 0.12.333 / SDK 1.0.39 to match it.
+			// Verified: opus-4.7/4.8/haiku-4.5/sonnet-4.6 all return 200 (+ native
+			// reasoningContentEvent for opus). The legacy Q/CodeWhisperer endpoints below
+			// remain as fallbacks (currently only reached on 429 quota exhaustion).
 			URL:                 fmt.Sprintf("https://runtime.%s.kiro.dev/generateAssistantResponse", region),
 			Origin:              "AI_EDITOR",
 			AmzTarget:           "",
 			Name:                "KiroRuntime",
 			KiroVersion:         "0.12.333",
 			StreamingSDKVersion: "1.0.39",
+		},
+		{
+			// Fallback: legacy Amazon Q endpoint (uses the account's default 0.9.x
+			// fingerprint). Works across all regions and auth types.
+			URL:       fmt.Sprintf("https://q.%s.amazonaws.com/generateAssistantResponse", region),
+			Origin:    "AI_EDITOR",
+			AmzTarget: "", // Empty = don't set X-Amz-Target header
+			Name:      "AmazonQ",
+		},
+		{
+			// Fallback: legacy CodeWhisperer endpoint (only works in us-east-1).
+			URL:       fmt.Sprintf("https://codewhisperer.%s.amazonaws.com/generateAssistantResponse", region),
+			Origin:    "AI_EDITOR",
+			AmzTarget: "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
+			Name:      "CodeWhisperer",
 		},
 	}
 }
