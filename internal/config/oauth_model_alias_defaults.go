@@ -6,6 +6,9 @@ import "strings"
 // These aliases expose standard Claude IDs for Kiro-prefixed upstream models.
 func defaultKiroAliases() []OAuthModelAlias {
 	return []OAuthModelAlias{
+		// Opus 5 / Sonnet 5 (current generation)
+		{Name: "kiro-claude-opus-5", Alias: "claude-opus-5", Fork: true},
+		{Name: "kiro-claude-sonnet-5", Alias: "claude-sonnet-5", Fork: true},
 		// Sonnet 4.6
 		{Name: "kiro-claude-sonnet-4-6", Alias: "claude-sonnet-4-6", Fork: true},
 		// Sonnet 4.5

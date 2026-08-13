@@ -741,6 +741,30 @@ func GetKiroModels() []*ModelInfo {
 			Thinking:            &ThinkingSupport{Min: 1024, Max: 32000, ZeroAllowed: true, DynamicAllowed: true},
 		},
 		{
+			ID:                  "kiro-claude-opus-5",
+			Object:              "model",
+			Created:             1786060800, // 2026-08-14
+			OwnedBy:             "aws",
+			Type:                "kiro",
+			DisplayName:         "Kiro Claude Opus 5",
+			Description:         "Claude Opus 5 via Kiro (2.2x credit)",
+			ContextLength:       DefaultKiroContextLength,
+			MaxCompletionTokens: DefaultKiroMaxCompletionTokens,
+			Thinking:            &ThinkingSupport{Min: 1024, Max: 32000, ZeroAllowed: true, DynamicAllowed: true},
+		},
+		{
+			ID:                  "kiro-claude-sonnet-5",
+			Object:              "model",
+			Created:             1786060800, // 2026-08-14
+			OwnedBy:             "aws",
+			Type:                "kiro",
+			DisplayName:         "Kiro Claude Sonnet 5",
+			Description:         "Claude Sonnet 5 via Kiro (1.3x credit)",
+			ContextLength:       DefaultKiroContextLength,
+			MaxCompletionTokens: DefaultKiroMaxCompletionTokens,
+			Thinking:            &ThinkingSupport{Min: 1024, Max: 32000, ZeroAllowed: true, DynamicAllowed: true},
+		},
+		{
 			ID:                  "kiro-claude-opus-4-8",
 			Object:              "model",
 			Created:             1780012800, // 2026-05-29
@@ -861,49 +885,43 @@ func GetKiroModels() []*ModelInfo {
 			MaxCompletionTokens: 32768,
 			Thinking:            &ThinkingSupport{Min: 1024, Max: 32000, ZeroAllowed: true, DynamicAllowed: true},
 		},
+		// The gpt-4o / gpt-4 / gpt-4-turbo / gpt-3.5-turbo entries that used to sit
+		// here were removed on 2026-08-14: ListAvailableModels on
+		// q.us-east-1.amazonaws.com does not offer them. Advertising them only ever
+		// "worked" because mapModelToKiro's pattern fallback quietly answered with
+		// claude-sonnet-4.5 instead. The GPT models Kiro actually serves are below.
 		{
-			ID:                  "kiro-gpt-4o",
+			ID:                  "kiro-gpt-5-6-sol",
 			Object:              "model",
-			Created:             1732752000,
+			Created:             1786060800, // 2026-08-14
 			OwnedBy:             "aws",
 			Type:                "kiro",
-			DisplayName:         "Kiro GPT-4o",
-			Description:         "OpenAI GPT-4o via Kiro",
-			ContextLength:       128000,
-			MaxCompletionTokens: 16384,
+			DisplayName:         "Kiro GPT 5.6 Sol",
+			Description:         "OpenAI GPT 5.6 Sol via Kiro (2.4x credit)",
+			ContextLength:       DefaultKiroContextLength,
+			MaxCompletionTokens: DefaultKiroMaxCompletionTokens,
 		},
 		{
-			ID:                  "kiro-gpt-4",
+			ID:                  "kiro-gpt-5-6-terra",
 			Object:              "model",
-			Created:             1732752000,
+			Created:             1786060800, // 2026-08-14
 			OwnedBy:             "aws",
 			Type:                "kiro",
-			DisplayName:         "Kiro GPT-4",
-			Description:         "OpenAI GPT-4 via Kiro",
-			ContextLength:       128000,
-			MaxCompletionTokens: 8192,
+			DisplayName:         "Kiro GPT 5.6 Terra",
+			Description:         "OpenAI GPT 5.6 Terra via Kiro (1.0x credit)",
+			ContextLength:       DefaultKiroContextLength,
+			MaxCompletionTokens: DefaultKiroMaxCompletionTokens,
 		},
 		{
-			ID:                  "kiro-gpt-4-turbo",
+			ID:                  "kiro-gpt-5-6-luna",
 			Object:              "model",
-			Created:             1732752000,
+			Created:             1786060800, // 2026-08-14
 			OwnedBy:             "aws",
 			Type:                "kiro",
-			DisplayName:         "Kiro GPT-4 Turbo",
-			Description:         "OpenAI GPT-4 Turbo via Kiro",
-			ContextLength:       128000,
-			MaxCompletionTokens: 16384,
-		},
-		{
-			ID:                  "kiro-gpt-3-5-turbo",
-			Object:              "model",
-			Created:             1732752000,
-			OwnedBy:             "aws",
-			Type:                "kiro",
-			DisplayName:         "Kiro GPT-3.5 Turbo",
-			Description:         "OpenAI GPT-3.5 Turbo via Kiro",
-			ContextLength:       16384,
-			MaxCompletionTokens: 4096,
+			DisplayName:         "Kiro GPT 5.6 Luna",
+			Description:         "OpenAI GPT 5.6 Luna via Kiro (0.1x credit)",
+			ContextLength:       DefaultKiroContextLength,
+			MaxCompletionTokens: DefaultKiroMaxCompletionTokens,
 		},
 		// --- Agentic Variants (Optimized for coding agents with chunked writes) ---
 		{

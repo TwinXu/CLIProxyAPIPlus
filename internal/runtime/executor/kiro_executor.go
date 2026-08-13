@@ -24,6 +24,7 @@ import (
 	"github.com/google/uuid"
 	kiroauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kiro"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	kiroclaude "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/kiro/claude"
 	kirocommon "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/kiro/common"
 	kiroopenai "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/kiro/openai"
@@ -695,6 +696,14 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		}
 	}
 
+	// Reject unknown models before anything with a side effect: the web_search
+	// branch below spends an MCP round-trip, and the reporter registered after it
+	// would otherwise attribute a purely client-side name error to this account.
+	kiroModelID, err := e.mapModelToKiro(req.Model)
+	if err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+
 	// Check for pure web_search request
 	// Route to MCP endpoint instead of normal Kiro API
 	if kiroclaude.HasWebSearchTool(req.Payload) {
@@ -708,8 +717,6 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("kiro")
 	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), true)
-
-	kiroModelID := e.mapModelToKiro(req.Model)
 
 	// Fetch profileArn if missing (for imported accounts from Kiro IDE)
 	if profileArn == "" {
@@ -1149,6 +1156,14 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		}
 	}
 
+	// Reject unknown models before anything with a side effect: the web_search
+	// branch below spends an MCP round-trip, and the reporter registered after it
+	// would otherwise attribute a purely client-side name error to this account.
+	kiroModelID, err := e.mapModelToKiro(req.Model)
+	if err != nil {
+		return nil, err
+	}
+
 	// Check for pure web_search request
 	// Route to MCP endpoint instead of normal Kiro API
 	if kiroclaude.HasWebSearchTool(req.Payload) {
@@ -1166,8 +1181,6 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("kiro")
 	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), true)
-
-	kiroModelID := e.mapModelToKiro(req.Model)
 
 	// Fetch profileArn if missing (for imported accounts from Kiro IDE)
 	if profileArn == "" {
@@ -1701,8 +1714,15 @@ func findRealThinkingEndTag(content string, alreadyInCodeBlock, alreadyInInlineC
 // determineAgenticMode determines if the model is an agentic or chat-only variant.
 // Returns (isAgentic, isChatOnly) based on model name suffixes.
 func determineAgenticMode(model string) (isAgentic, isChatOnly bool) {
-	isAgentic = strings.HasSuffix(model, "-agentic")
-	isChatOnly = strings.HasSuffix(model, "-chat")
+	// Strip the thinking budget suffix and normalise case the same way
+	// canonicalKiroModelName does, so "claude-opus-5-agentic(8192)" and
+	// "CLAUDE-OPUS-5-AGENTIC" still select agentic shaping. Accepting a name in
+	// mapModelToKiro but silently dropping its mode here would be the same class
+	// of quiet substitution this pair of functions exists to prevent.
+	name := thinking.ParseSuffix(strings.TrimSpace(model)).ModelName
+	name = strings.ToLower(strings.TrimSpace(name))
+	isAgentic = strings.HasSuffix(name, "-agentic")
+	isChatOnly = strings.HasSuffix(name, "-chat")
 	return isAgentic, isChatOnly
 }
 
@@ -1729,128 +1749,103 @@ func getEffectiveProfileArnWithWarning(auth *cliproxyauth.Auth, profileArn strin
 	return profileArn
 }
 
-// mapModelToKiro maps external model names to Kiro model IDs.
-// Supports both Kiro and Amazon Q prefixes since they use the same API.
-// Agentic variants (-agentic suffix) map to the same backend model IDs.
-func (e *KiroExecutor) mapModelToKiro(model string) string {
-	modelMap := map[string]string{
-		// Amazon Q format (amazonq- prefix) - same API as Kiro
-		"amazonq-auto":                       "auto",
-		"amazonq-claude-opus-4-8":            "claude-opus-4.8",
-		"amazonq-claude-opus-4.8":            "claude-opus-4.8",
-		"amazonq-claude-opus-4-7":            "claude-opus-4.7",
-		"amazonq-claude-opus-4-6":            "claude-opus-4.6",
-		"amazonq-claude-sonnet-4-6":          "claude-sonnet-4.6",
-		"amazonq-claude-opus-4-5":            "claude-opus-4.5",
-		"amazonq-claude-sonnet-4-5":          "claude-sonnet-4.5",
-		"amazonq-claude-sonnet-4-5-20250929": "claude-sonnet-4.5",
-		"amazonq-claude-sonnet-4":            "claude-sonnet-4",
-		"amazonq-claude-sonnet-4-20250514":   "claude-sonnet-4",
-		"amazonq-claude-haiku-4-5":           "claude-haiku-4.5",
-		// Kiro format (kiro- prefix) - valid model names that should be preserved
-		"kiro-claude-opus-4-8":            "claude-opus-4.8",
-		"kiro-claude-opus-4-7":            "claude-opus-4.7",
-		"kiro-claude-opus-4-6":            "claude-opus-4.6",
-		"kiro-claude-sonnet-4-6":          "claude-sonnet-4.6",
-		"kiro-claude-opus-4-5":            "claude-opus-4.5",
-		"kiro-claude-sonnet-4-5":          "claude-sonnet-4.5",
-		"kiro-claude-sonnet-4-5-20250929": "claude-sonnet-4.5",
-		"kiro-claude-sonnet-4":            "claude-sonnet-4",
-		"kiro-claude-sonnet-4-20250514":   "claude-sonnet-4",
-		"kiro-claude-haiku-4-5":           "claude-haiku-4.5",
-		"kiro-auto":                       "auto",
-		// Native format (no prefix) - used by Kiro IDE directly
-		"claude-opus-4-8":            "claude-opus-4.8",
-		"claude-opus-4.8":            "claude-opus-4.8",
-		"claude-opus-4-7":            "claude-opus-4.7",
-		"claude-opus-4.7":            "claude-opus-4.7",
-		"claude-opus-4-6":            "claude-opus-4.6",
-		"claude-opus-4.6":            "claude-opus-4.6",
-		"claude-sonnet-4-6":          "claude-sonnet-4.6",
-		"claude-sonnet-4.6":          "claude-sonnet-4.6",
-		"claude-opus-4-5":            "claude-opus-4.5",
-		"claude-opus-4.5":            "claude-opus-4.5",
-		"claude-haiku-4-5":           "claude-haiku-4.5",
-		"claude-haiku-4.5":           "claude-haiku-4.5",
-		"claude-sonnet-4-5":          "claude-sonnet-4.5",
-		"claude-sonnet-4-5-20250929": "claude-sonnet-4.5",
-		"claude-sonnet-4.5":          "claude-sonnet-4.5",
-		"claude-sonnet-4":            "claude-sonnet-4",
-		"claude-sonnet-4-20250514":   "claude-sonnet-4",
-		"auto":                       "auto",
-		// Agentic variants (same backend model IDs, but with special system prompt)
-		"claude-opus-4.8-agentic":        "claude-opus-4.8",
-		"claude-opus-4-8-agentic":        "claude-opus-4.8",
-		"claude-opus-4.7-agentic":        "claude-opus-4.7",
-		"claude-opus-4.6-agentic":        "claude-opus-4.6",
-		"claude-sonnet-4.6-agentic":      "claude-sonnet-4.6",
-		"claude-opus-4.5-agentic":        "claude-opus-4.5",
-		"claude-sonnet-4.5-agentic":      "claude-sonnet-4.5",
-		"claude-sonnet-4-agentic":        "claude-sonnet-4",
-		"claude-haiku-4.5-agentic":       "claude-haiku-4.5",
-		"kiro-claude-opus-4-8-agentic":   "claude-opus-4.8",
-		"kiro-claude-opus-4-7-agentic":   "claude-opus-4.7",
-		"kiro-claude-opus-4-6-agentic":   "claude-opus-4.6",
-		"kiro-claude-sonnet-4-6-agentic": "claude-sonnet-4.6",
-		"kiro-claude-opus-4-5-agentic":   "claude-opus-4.5",
-		"kiro-claude-sonnet-4-5-agentic": "claude-sonnet-4.5",
-		"kiro-claude-sonnet-4-agentic":   "claude-sonnet-4",
-		"kiro-claude-haiku-4-5-agentic":  "claude-haiku-4.5",
-	}
-	if kiroID, ok := modelMap[model]; ok {
-		return kiroID
-	}
+// kiroModelIDs maps a canonical model name (see canonicalKiroModelName) to the
+// exact modelId the Kiro (AWS CodeWhisperer) backend expects. Every value is a
+// modelId the backend actually serves, verified against ListAvailableModels on
+// q.us-east-1.amazonaws.com (2026-08-14); that response is also the reason
+// claude-3-7-sonnet and the gpt-4* family are absent — the backend no longer
+// lists them. Adding an entry whose value the backend does not serve turns a
+// clear 400 into an upstream failure, so keep this table in sync with
+// ListAvailableModels rather than guessing.
+//
+// Keys are dot-free because normalizeKiroModelID folds "." to "-" when the
+// catalogue is built, so the advertised id is "kiro-gpt-5-6-sol" even though the
+// backend wants "gpt-5.6-sol". Values keep the backend's own spelling.
+var kiroModelIDs = map[string]string{
+	// Backend-side router.
+	"auto": "auto",
 
-	// Smart fallback: try to infer model type from name patterns
-	modelLower := strings.ToLower(model)
+	// Anthropic — current generation.
+	"claude-opus-5":   "claude-opus-5",
+	"claude-sonnet-5": "claude-sonnet-5",
 
-	// Check for Haiku variants
-	if strings.Contains(modelLower, "haiku") {
-		log.Debugf("kiro: unknown Haiku model '%s', mapping to claude-haiku-4.5", model)
-		return "claude-haiku-4.5"
+	// Anthropic — previous generations.
+	"claude-opus-4-8":   "claude-opus-4.8",
+	"claude-opus-4-7":   "claude-opus-4.7",
+	"claude-opus-4-6":   "claude-opus-4.6",
+	"claude-opus-4-5":   "claude-opus-4.5",
+	"claude-sonnet-4-6": "claude-sonnet-4.6",
+	"claude-sonnet-4-5": "claude-sonnet-4.5",
+	"claude-sonnet-4":   "claude-sonnet-4",
+	"claude-haiku-4-5":  "claude-haiku-4.5",
+
+	// Dated aliases that name exactly the same release as the entry above them.
+	// These are identities, not substitutions.
+	"claude-opus-4-5-20251101":   "claude-opus-4.5",
+	"claude-sonnet-4-5-20250929": "claude-sonnet-4.5",
+	"claude-sonnet-4-20250514":   "claude-sonnet-4",
+	"claude-haiku-4-5-20251001":  "claude-haiku-4.5",
+
+	// Non-Anthropic models the Kiro backend also serves.
+	"gpt-5-6-sol":      "gpt-5.6-sol",
+	"gpt-5-6-terra":    "gpt-5.6-terra",
+	"gpt-5-6-luna":     "gpt-5.6-luna",
+	"deepseek-3-2":     "deepseek-3.2",
+	"minimax-m2-5":     "minimax-m2.5",
+	"minimax-m2-1":     "minimax-m2.1",
+	"glm-5":            "glm-5",
+	"qwen3-coder-next": "qwen3-coder-next",
+}
+
+// canonicalKiroModelName reduces an external model name to its kiroModelIDs key.
+// It is the single place that knows which parts of a model string are addressing
+// (vendor prefix, catalogue dot-folding) and which are request-shaping knobs
+// (thinking budget suffix, agentic/chat mode) rather than a different model.
+func canonicalKiroModelName(model string) string {
+	// "(8192)" is a thinking budget, not part of the name. Every Kiro model
+	// advertises thinking support, so this suffix is a first-class request form
+	// and each other executor strips it the same way.
+	name := thinking.ParseSuffix(strings.TrimSpace(model)).ModelName
+	name = strings.ToLower(strings.TrimSpace(name))
+
+	// "-agentic"/"-chat" select a request shape (see determineAgenticMode).
+	name = strings.TrimSuffix(name, "-agentic")
+	name = strings.TrimSuffix(name, "-chat")
+
+	// Both vendor prefixes address the same CodeWhisperer API.
+	name = strings.TrimPrefix(name, "kiro-")
+	name = strings.TrimPrefix(name, "amazonq-")
+
+	// Match normalizeKiroModelID's dot folding so the advertised id and the
+	// backend spelling collapse onto one key.
+	return strings.ReplaceAll(name, ".", "-")
+}
+
+// mapModelToKiro resolves an external model name to a Kiro backend modelId.
+// It returns a 400-carrying error for any name the backend does not serve.
+//
+// It deliberately does not guess a "close enough" model. The previous
+// pattern-matching fallback rewrote every unrecognised name into some older
+// model — claude-opus-5 became claude-opus-4.5, anything unmatched became
+// claude-sonnet-4.5 — while the response kept echoing the *requested* name.
+// Callers had no way to learn they were being answered by a different, much
+// weaker model, and the substitution only surfaced as degraded behaviour
+// (e.g. tool calls emitted as literal text instead of tool_use blocks).
+// A rejected request is recoverable; silently answering as another model is not.
+//
+// The error carries StatusBadRequest so the conductor treats it as the
+// client-side error it is. A bare error would read as status 0, which makes
+// MarkResult flag the account unavailable, persist auth.Status=StatusError and
+// retry the doomed request against every other Kiro auth.
+func (e *KiroExecutor) mapModelToKiro(model string) (string, error) {
+	name := canonicalKiroModelName(model)
+	if kiroID, ok := kiroModelIDs[name]; ok {
+		return kiroID, nil
 	}
-
-	// Check for Sonnet variants
-	if strings.Contains(modelLower, "sonnet") {
-		// Check for specific version patterns
-		if strings.Contains(modelLower, "3-7") || strings.Contains(modelLower, "3.7") {
-			log.Debugf("kiro: unknown Sonnet 3.7 model '%s', mapping to claude-3-7-sonnet-20250219", model)
-			return "claude-3-7-sonnet-20250219"
-		}
-		if strings.Contains(modelLower, "4-6") || strings.Contains(modelLower, "4.6") {
-			log.Debugf("kiro: unknown Sonnet 4.6 model '%s', mapping to claude-sonnet-4.6", model)
-			return "claude-sonnet-4.6"
-		}
-		if strings.Contains(modelLower, "4-5") || strings.Contains(modelLower, "4.5") {
-			log.Debugf("kiro: unknown Sonnet 4.5 model '%s', mapping to claude-sonnet-4.5", model)
-			return "claude-sonnet-4.5"
-		}
-		// Default to Sonnet 4
-		log.Debugf("kiro: unknown Sonnet model '%s', mapping to claude-sonnet-4", model)
-		return "claude-sonnet-4"
+	return "", statusErr{
+		code: http.StatusBadRequest,
+		msg:  fmt.Sprintf("kiro: unsupported model %q (resolved to %q); the Kiro backend does not serve it", model, name),
 	}
-
-	// Check for Opus variants
-	if strings.Contains(modelLower, "opus") {
-		if strings.Contains(modelLower, "4-8") || strings.Contains(modelLower, "4.8") {
-			log.Debugf("kiro: unknown Opus 4.8 model '%s', mapping to claude-opus-4.8", model)
-			return "claude-opus-4.8"
-		}
-		if strings.Contains(modelLower, "4-7") || strings.Contains(modelLower, "4.7") {
-			log.Debugf("kiro: unknown Opus 4.7 model '%s', mapping to claude-opus-4.7", model)
-			return "claude-opus-4.7"
-		}
-		if strings.Contains(modelLower, "4-6") || strings.Contains(modelLower, "4.6") {
-			log.Debugf("kiro: unknown Opus 4.6 model '%s', mapping to claude-opus-4.6", model)
-			return "claude-opus-4.6"
-		}
-		log.Debugf("kiro: unknown Opus model '%s', mapping to claude-opus-4.5", model)
-		return "claude-opus-4.5"
-	}
-
-	// Final fallback to Sonnet 4.5 (most commonly used model)
-	log.Warnf("kiro: unknown model '%s', falling back to claude-sonnet-4.5", model)
-	return "claude-sonnet-4.5"
 }
 
 // kiroCreditUSDForModel returns the empirical USD-equivalence of one Kiro
@@ -5164,7 +5159,10 @@ func (e *KiroExecutor) callKiroAndBuffer(
 	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), true)
 	log.Debugf("kiro/websearch GAR request: %d bytes", len(body))
 
-	kiroModelID := e.mapModelToKiro(req.Model)
+	kiroModelID, err := e.mapModelToKiro(req.Model)
+	if err != nil {
+		return nil, err
+	}
 	isAgentic, isChatOnly := determineAgenticMode(req.Model)
 	effectiveProfileArn := getEffectiveProfileArnWithWarning(auth, profileArn)
 
@@ -5206,7 +5204,10 @@ func (e *KiroExecutor) callKiroDirectStream(
 	to := sdktranslator.FromString("kiro")
 	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), true)
 
-	kiroModelID := e.mapModelToKiro(req.Model)
+	kiroModelID, err := e.mapModelToKiro(req.Model)
+	if err != nil {
+		return nil, err
+	}
 	isAgentic, isChatOnly := determineAgenticMode(req.Model)
 	effectiveProfileArn := getEffectiveProfileArnWithWarning(auth, profileArn)
 
@@ -5256,13 +5257,17 @@ func (e *KiroExecutor) executeNonStreamFallback(
 	to := sdktranslator.FromString("kiro")
 	body := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), true)
 
-	kiroModelID := e.mapModelToKiro(req.Model)
+	kiroModelID, err := e.mapModelToKiro(req.Model)
+	if err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
 	isAgentic, isChatOnly := determineAgenticMode(req.Model)
 	effectiveProfileArn := getEffectiveProfileArnWithWarning(auth, profileArn)
 	tokenKey := getAccountKey(auth)
 
 	reporter := newUsageReporter(ctx, e.Identifier(), req.Model, auth)
-	var err error
+	// err is already declared by the mapModelToKiro call above; trackFailure
+	// takes its address so later assignments below are what gets reported.
 	defer reporter.trackFailure(ctx, &err)
 
 	resp, err := e.executeWithRetry(ctx, auth, req, opts, accessToken, effectiveProfileArn, nil, body, from, to, reporter, "", kiroModelID, isAgentic, isChatOnly, tokenKey)

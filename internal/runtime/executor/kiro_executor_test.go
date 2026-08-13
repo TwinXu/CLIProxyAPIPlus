@@ -752,12 +752,95 @@ func TestKiroMapModelToKiroSupportsOpus48(t *testing.T) {
 		{"claude-opus-4.8", "claude-opus-4.8"},
 		{"kiro-claude-opus-4-8-agentic", "claude-opus-4.8"},
 		{"claude-opus-4-8-agentic", "claude-opus-4.8"},
-		{"custom-claude-opus-4-8-preview", "claude-opus-4.8"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.model, func(t *testing.T) {
-			if got := executor.mapModelToKiro(tc.model); got != tc.want {
+			got, err := executor.mapModelToKiro(tc.model)
+			if err != nil {
+				t.Fatalf("mapModelToKiro(%q) returned error: %v", tc.model, err)
+			}
+			if got != tc.want {
 				t.Fatalf("mapModelToKiro(%q) = %q, want %q", tc.model, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestKiroMapModelToKiroCurrentGeneration pins the current-generation models to
+// themselves. Before this was mapped explicitly, "claude-opus-5" fell through
+// the pattern-matching fallback and was served as claude-opus-4.5 while the
+// response still echoed "claude-opus-5" — the substitution was only observable
+// as degraded behaviour, never as an error.
+func TestKiroMapModelToKiroCurrentGeneration(t *testing.T) {
+	executor := &KiroExecutor{}
+	cases := []struct {
+		model string
+		want  string
+	}{
+		{"claude-opus-5", "claude-opus-5"},
+		{"claude-sonnet-5", "claude-sonnet-5"},
+		{"kiro-claude-opus-5", "claude-opus-5"},
+		{"amazonq-claude-opus-5", "claude-opus-5"},
+		{"claude-opus-5-agentic", "claude-opus-5"},
+		{"claude-opus-5-chat", "claude-opus-5"},
+		{"CLAUDE-OPUS-5", "claude-opus-5"},
+		{"  claude-opus-5  ", "claude-opus-5"},
+		// Thinking budget suffix: every Kiro model advertises thinking support,
+		// so this is a shipped request form, not a hypothetical one.
+		{"claude-opus-5(8192)", "claude-opus-5"},
+		{"kiro-claude-opus-4-8(8192)", "claude-opus-4.8"},
+		{"kiro-claude-opus-5-agentic(4096)", "claude-opus-5"},
+		// Non-Anthropic models, spelled the way the catalogue advertises them:
+		// normalizeKiroModelID folds "." to "-", so a client can only ever send
+		// the dashed form even though the backend wants the dotted one.
+		{"kiro-gpt-5-6-sol", "gpt-5.6-sol"},
+		{"kiro-gpt-5-6-terra", "gpt-5.6-terra"},
+		{"kiro-deepseek-3-2", "deepseek-3.2"},
+		{"kiro-minimax-m2-5", "minimax-m2.5"},
+		{"kiro-minimax-m2-1", "minimax-m2.1"},
+		{"gpt-5.6-sol", "gpt-5.6-sol"},
+		{"deepseek-3.2", "deepseek-3.2"},
+		{"glm-5", "glm-5"},
+		{"qwen3-coder-next", "qwen3-coder-next"},
+		// Dated alias shipped in defaultKiroAliases.
+		{"claude-haiku-4-5-20251001", "claude-haiku-4.5"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.model, func(t *testing.T) {
+			got, err := executor.mapModelToKiro(tc.model)
+			if err != nil {
+				t.Fatalf("mapModelToKiro(%q) returned error: %v", tc.model, err)
+			}
+			if got != tc.want {
+				t.Fatalf("mapModelToKiro(%q) = %q, want %q", tc.model, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestKiroMapModelToKiroRejectsUnknown asserts we fail loudly instead of
+// substituting a different model. Each name here is one the old fallback
+// silently rewrote into some older Anthropic model.
+func TestKiroMapModelToKiroRejectsUnknown(t *testing.T) {
+	executor := &KiroExecutor{}
+	unknown := []string{
+		"custom-claude-opus-4-8-preview",
+		"claude-fable-5",
+		"claude-3-5-sonnet-20241022",
+		"claude-3-7-sonnet-20250219",
+		"claude-opus-4-1-20250805",
+		"claude-opus-4-20250514",
+		"gpt-4o",
+		"",
+	}
+	for _, model := range unknown {
+		t.Run(model, func(t *testing.T) {
+			got, err := executor.mapModelToKiro(model)
+			if err == nil {
+				t.Fatalf("mapModelToKiro(%q) = %q, want error", model, got)
+			}
+			if got != "" {
+				t.Fatalf("mapModelToKiro(%q) returned %q alongside an error, want empty", model, got)
 			}
 		})
 	}
