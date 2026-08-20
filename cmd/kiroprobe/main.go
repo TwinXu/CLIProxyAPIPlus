@@ -24,6 +24,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -46,7 +47,7 @@ func main() {
 	}
 
 	auth := kiro.NewKiroAuth(&config.Config{})
-	tokenData, err := auth.LoadTokenFromFile(*tokenFile)
+	tokenData, err := loadToken(*tokenFile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "load token: %v\n", err)
 		os.Exit(1)
@@ -105,6 +106,57 @@ func main() {
 		}
 		fmt.Println()
 	}
+}
+
+// loadToken accepts both Kiro credential layouts. Kiro IDE's own
+// kiro-auth-token.json is camelCase and matches kiro.KiroTokenData; the files
+// this proxy writes under auths/ are snake_case and match kiro.KiroTokenStorage.
+// Unmarshalling the wrong one succeeds and silently yields empty fields, which
+// reaches the backend as an empty bearer token and comes back as a 400 about an
+// invalid token -- so decide by which layout actually carries an access token.
+func loadToken(path string) (*kiro.KiroTokenData, error) {
+	if strings.HasPrefix(path, "~") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return nil, err
+		}
+		path = filepath.Join(home, path[1:])
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	var camel kiro.KiroTokenData
+	if err := json.Unmarshal(raw, &camel); err == nil && strings.TrimSpace(camel.AccessToken) != "" {
+		return &camel, nil
+	}
+
+	var snake kiro.KiroTokenStorage
+	if err := json.Unmarshal(raw, &snake); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(snake.AccessToken) == "" {
+		return nil, fmt.Errorf("no access token found in %s (recognised neither the camelCase IDE layout nor the snake_case auths/ layout)", path)
+	}
+	if expiry := strings.TrimSpace(snake.ExpiresAt); expiry != "" {
+		if at, errParse := time.Parse(time.RFC3339, expiry); errParse == nil && time.Now().After(at) {
+			fmt.Fprintf(os.Stderr, "warning: token expired at %s; refresh it or the backend will reject the request\n", expiry)
+		}
+	}
+	return &kiro.KiroTokenData{
+		AccessToken:  snake.AccessToken,
+		RefreshToken: snake.RefreshToken,
+		ProfileArn:   snake.ProfileArn,
+		ExpiresAt:    snake.ExpiresAt,
+		AuthMethod:   snake.AuthMethod,
+		Provider:     snake.Provider,
+		ClientID:     snake.ClientID,
+		ClientSecret: snake.ClientSecret,
+		Email:        snake.Email,
+		StartURL:     snake.StartURL,
+		Region:       snake.Region,
+	}, nil
 }
 
 func sortedKeys(m map[string]any) []string {
