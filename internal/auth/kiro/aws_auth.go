@@ -198,6 +198,20 @@ func (k *KiroAuth) GetUsageLimits(ctx context.Context, tokenData *KiroTokenData)
 	return usage, nil
 }
 
+// ListAvailableModelsRaw returns the unparsed ListAvailableModels response body.
+//
+// ListAvailableModels keeps only the handful of fields the registry consumes and
+// discards the rest of each entry -- notably everything in tokenLimits other than
+// maxInputTokens. When the question is what the backend actually reports for a
+// model (context window, output ceiling, thinking limits), the parsed struct
+// cannot answer it and the raw body can.
+func (k *KiroAuth) ListAvailableModelsRaw(ctx context.Context, tokenData *KiroTokenData) ([]byte, error) {
+	return k.makeRequest(ctx, pathListAvailableModels, tokenData, map[string]string{
+		"origin":     "AI_EDITOR",
+		"profileArn": tokenData.ProfileArn,
+	})
+}
+
 // ListAvailableModels retrieves available models from the CodeWhisperer API.
 // This method fetches the list of AI models available for the authenticated user.
 //
