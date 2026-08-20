@@ -241,8 +241,25 @@ func (k *KiroAuth) ListAvailableModels(ctx context.Context, tokenData *KiroToken
 			RateMultiplier float64 `json:"rateMultiplier"`
 			RateUnit       string  `json:"rateUnit"`
 			TokenLimits    *struct {
-				MaxInputTokens int `json:"maxInputTokens"`
+				MaxInputTokens  int `json:"maxInputTokens"`
+				MaxOutputTokens int `json:"maxOutputTokens"`
 			} `json:"tokenLimits"`
+			// additionalModelRequestFieldsSchema is a JSON Schema describing the
+			// extra request fields this model accepts. For Claude 4.6 and newer it
+			// carries the output_config.effort enum, which is the backend's own
+			// statement of the reasoning levels it will honour.
+			AdditionalModelRequestFieldsSchema *struct {
+				Properties *struct {
+					OutputConfig *struct {
+						Properties *struct {
+							Effort *struct {
+								Enum    []string `json:"enum"`
+								Default string   `json:"default"`
+							} `json:"effort"`
+						} `json:"properties"`
+					} `json:"output_config"`
+				} `json:"properties"`
+			} `json:"additionalModelRequestFieldsSchema"`
 		} `json:"models"`
 	}
 
@@ -252,17 +269,32 @@ func (k *KiroAuth) ListAvailableModels(ctx context.Context, tokenData *KiroToken
 
 	models := make([]*KiroModel, 0, len(result.Models))
 	for _, m := range result.Models {
-		maxInputTokens := 0
+		maxInputTokens, maxOutputTokens := 0, 0
 		if m.TokenLimits != nil {
 			maxInputTokens = m.TokenLimits.MaxInputTokens
+			maxOutputTokens = m.TokenLimits.MaxOutputTokens
+		}
+		var effortLevels []string
+		defaultEffort := ""
+		if schema := m.AdditionalModelRequestFieldsSchema; schema != nil &&
+			schema.Properties != nil &&
+			schema.Properties.OutputConfig != nil &&
+			schema.Properties.OutputConfig.Properties != nil &&
+			schema.Properties.OutputConfig.Properties.Effort != nil {
+			effort := schema.Properties.OutputConfig.Properties.Effort
+			effortLevels = append(effortLevels, effort.Enum...)
+			defaultEffort = effort.Default
 		}
 		models = append(models, &KiroModel{
-			ModelID:        m.ModelID,
-			ModelName:      m.ModelName,
-			Description:    m.Description,
-			RateMultiplier: m.RateMultiplier,
-			RateUnit:       m.RateUnit,
-			MaxInputTokens: maxInputTokens,
+			ModelID:         m.ModelID,
+			ModelName:       m.ModelName,
+			Description:     m.Description,
+			RateMultiplier:  m.RateMultiplier,
+			RateUnit:        m.RateUnit,
+			MaxInputTokens:  maxInputTokens,
+			MaxOutputTokens: maxOutputTokens,
+			EffortLevels:    effortLevels,
+			DefaultEffort:   defaultEffort,
 		})
 	}
 

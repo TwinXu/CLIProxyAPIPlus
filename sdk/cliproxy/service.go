@@ -1740,13 +1740,30 @@ func convertKiroAPIModels(apiModels []*kiroauth.KiroModel) []*ModelInfo {
 			Type:                "kiro",
 			DisplayName:         formatKiroDisplayName(m.ModelName, m.RateMultiplier),
 			Description:         m.Description,
-			ContextLength:       200000,
-			MaxCompletionTokens: 64000,
-			Thinking:            &registry.ThinkingSupport{Min: 1024, Max: 32000, ZeroAllowed: true, DynamicAllowed: true},
+			ContextLength:       registry.DefaultKiroContextLength,
+			MaxCompletionTokens: registry.DefaultKiroMaxCompletionTokens,
 		}
 
+		// Prefer what the backend reports; the defaults describe the Claude 4.5-era
+		// backend and understate everything from 4.6 onwards.
 		if m.MaxInputTokens > 0 {
 			info.ContextLength = m.MaxInputTokens
+		}
+		if m.MaxOutputTokens > 0 {
+			info.MaxCompletionTokens = m.MaxOutputTokens
+		}
+
+		// Thinking strength on Kiro is a discrete effort level, not a token budget:
+		// the backend's schema exposes output_config.effort with an explicit enum and
+		// no budget field anywhere. Take the levels it reports rather than asserting
+		// a range it never accepts. A model that declares no enum (Claude 4.5 and
+		// older) is telling us it has no adaptive thinking to configure.
+		if len(m.EffortLevels) > 0 {
+			info.Thinking = &registry.ThinkingSupport{
+				ZeroAllowed:    true,
+				DynamicAllowed: true,
+				Levels:         append([]string(nil), m.EffortLevels...),
+			}
 		}
 
 		models = append(models, info)
@@ -1823,13 +1840,19 @@ func generateKiroAgenticVariants(models []*ModelInfo) []*ModelInfo {
 			MaxCompletionTokens: m.MaxCompletionTokens,
 		}
 
-		// Copy thinking support if present
+		// Copy thinking support if present. Levels must be carried over too:
+		// detectModelCapability treats a model with neither Min/Max nor Levels as
+		// having no thinking support at all, so dropping Levels here would demote
+		// every level-only model's agentic variant. That is not hypothetical --
+		// claude-opus-5 and claude-sonnet-5 have no static -agentic entry, so this
+		// function is the only thing that defines their variants.
 		if m.Thinking != nil {
 			agentic.Thinking = &registry.ThinkingSupport{
 				Min:            m.Thinking.Min,
 				Max:            m.Thinking.Max,
 				ZeroAllowed:    m.Thinking.ZeroAllowed,
 				DynamicAllowed: m.Thinking.DynamicAllowed,
+				Levels:         append([]string(nil), m.Thinking.Levels...),
 			}
 		}
 

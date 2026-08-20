@@ -88,6 +88,17 @@ type KiroModel struct {
 	RateUnit string `json:"rateUnit"`
 	// MaxInputTokens is the maximum input token limit
 	MaxInputTokens int `json:"maxInputTokens,omitempty"`
+	// MaxOutputTokens is the maximum output token limit
+	MaxOutputTokens int `json:"maxOutputTokens,omitempty"`
+	// EffortLevels lists the reasoning effort levels the backend accepts for this
+	// model, taken from additionalModelRequestFieldsSchema. Empty for models that
+	// declare no schema, which is how the backend says the model has no adaptive
+	// thinking at all (Claude 4.5 and older).
+	EffortLevels []string `json:"effortLevels,omitempty"`
+	// DefaultEffort is the effort level the backend applies when a request does
+	// not specify one. Informational: we deliberately send no effort in that case
+	// so the backend's own default stays authoritative.
+	DefaultEffort string `json:"defaultEffort,omitempty"`
 }
 
 // KiroIDETokenFile is the default path to Kiro IDE's token file

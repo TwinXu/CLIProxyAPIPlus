@@ -704,6 +704,10 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		return cliproxyexecutor.Response{}, err
 	}
 
+	if req.Payload, err = applyKiroThinking(req.Payload, req.Model, opts.SourceFormat.String()); err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+
 	// Check for pure web_search request
 	// Route to MCP endpoint instead of normal Kiro API
 	if kiroclaude.HasWebSearchTool(req.Payload) {
@@ -1161,6 +1165,10 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	// would otherwise attribute a purely client-side name error to this account.
 	kiroModelID, err := e.mapModelToKiro(req.Model)
 	if err != nil {
+		return nil, err
+	}
+
+	if req.Payload, err = applyKiroThinking(req.Payload, req.Model, opts.SourceFormat.String()); err != nil {
 		return nil, err
 	}
 
@@ -1709,6 +1717,42 @@ func findRealThinkingEndTag(content string, alreadyInCodeBlock, alreadyInInlineC
 		// This looks like a real end tag
 		return endIdx
 	}
+}
+
+// applyKiroThinking normalises the request's thinking configuration against the
+// Kiro model's declared capabilities and writes the result back into the payload,
+// in the source format, before any translation happens.
+//
+// Kiro was the only executor that never called thinking.ApplyThinking, with two
+// consequences. A thinking suffix was parsed for routing and then dropped, so the
+// "high" in claude-opus-5(high) never reached the request at all. And nothing
+// reconciled a client's request with what the model actually accepts, so a
+// budget-style request survived unchanged to a backend that takes discrete effort
+// levels and no budget.
+//
+// providerFormat is the source format so the claude/openai appliers write back
+// into the shape the Kiro translators already read; providerKey is "kiro" so the
+// capabilities come from the Kiro registry entries rather than a same-named model
+// on another provider.
+//
+// A validation error is returned to the caller rather than swallowed, matching
+// every other executor. Asking for an effort level the model does not offer --
+// xhigh on claude-opus-4.6, say -- has to be an error: dropping the config here
+// would leave the backend applying its own default, which is the silent
+// substitution this package exists to avoid.
+func applyKiroThinking(payload []byte, model string, sourceFormat string) ([]byte, error) {
+	sourceFormat = strings.ToLower(strings.TrimSpace(sourceFormat))
+	if len(payload) == 0 || sourceFormat == "" {
+		return payload, nil
+	}
+	applied, err := thinking.ApplyThinking(payload, model, sourceFormat, sourceFormat, "kiro")
+	if err != nil {
+		return payload, err
+	}
+	if len(applied) == 0 {
+		return payload, nil
+	}
+	return applied, nil
 }
 
 // determineAgenticMode determines if the model is an agentic or chat-only variant.

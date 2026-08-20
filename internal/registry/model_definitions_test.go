@@ -108,15 +108,38 @@ func findModelInfo(models []*ModelInfo, id string) *ModelInfo {
 	return nil
 }
 
+// assertKiroOpus48ModelInfo checks the Kiro entry against what ListAvailableModels
+// on q.us-east-1.amazonaws.com reports for claude-opus-4.8: a 1M context, a 128K
+// output ceiling, and effort levels rather than a thinking budget. These differ
+// from the Amazon Q entry for the same Claude release, so the limits are asserted
+// here rather than in the shared helper.
 func assertKiroOpus48ModelInfo(t *testing.T, model *ModelInfo, displayName, description string) {
 	t.Helper()
 
 	assertAWSOpus48ModelInfo(t, model, displayName, description)
+	if model.ContextLength != 1000000 {
+		t.Fatalf("context length mismatch: got %d, want 1000000", model.ContextLength)
+	}
+	if model.MaxCompletionTokens != 128000 {
+		t.Fatalf("max completion tokens mismatch: got %d, want 128000", model.MaxCompletionTokens)
+	}
 	if model.Thinking == nil {
 		t.Fatal("missing thinking support")
 	}
-	if model.Thinking.Min != 1024 || model.Thinking.Max != 32000 || !model.Thinking.ZeroAllowed || !model.Thinking.DynamicAllowed {
+	if model.Thinking.Min != 0 || model.Thinking.Max != 0 {
+		t.Fatalf("thinking must not declare a token budget; the backend accepts none: %+v", model.Thinking)
+	}
+	if !model.Thinking.ZeroAllowed || !model.Thinking.DynamicAllowed {
 		t.Fatalf("thinking support mismatch: %+v", model.Thinking)
+	}
+	want := []string{"low", "medium", "high", "xhigh", "max"}
+	if len(model.Thinking.Levels) != len(want) {
+		t.Fatalf("effort levels mismatch: got %v, want %v", model.Thinking.Levels, want)
+	}
+	for i := range want {
+		if model.Thinking.Levels[i] != want[i] {
+			t.Fatalf("effort levels mismatch: got %v, want %v", model.Thinking.Levels, want)
+		}
 	}
 }
 
@@ -124,6 +147,12 @@ func assertAmazonQOpus48ModelInfo(t *testing.T, model *ModelInfo, displayName, d
 	t.Helper()
 
 	assertAWSOpus48ModelInfo(t, model, displayName, description)
+	if model.ContextLength != 200000 {
+		t.Fatalf("context length mismatch: got %d, want 200000", model.ContextLength)
+	}
+	if model.MaxCompletionTokens != 64000 {
+		t.Fatalf("max completion tokens mismatch: got %d, want 64000", model.MaxCompletionTokens)
+	}
 }
 
 func assertAWSOpus48ModelInfo(t *testing.T, model *ModelInfo, displayName, description string) {
@@ -143,12 +172,6 @@ func assertAWSOpus48ModelInfo(t *testing.T, model *ModelInfo, displayName, descr
 	}
 	if model.Description != description {
 		t.Fatalf("description mismatch: got %q, want %q", model.Description, description)
-	}
-	if model.ContextLength != 200000 {
-		t.Fatalf("context length mismatch: got %d", model.ContextLength)
-	}
-	if model.MaxCompletionTokens != 64000 {
-		t.Fatalf("max completion tokens mismatch: got %d", model.MaxCompletionTokens)
 	}
 }
 
