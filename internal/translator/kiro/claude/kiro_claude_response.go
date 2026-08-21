@@ -79,6 +79,9 @@ func BuildClaudeResponse(content string, toolUses []KiroToolUse, model string, u
 
 	// Use upstream stopReason; apply fallback logic if not provided
 	// SOFT_LIMIT_REACHED: Keep stop_reason = "tool_use" so Claude continues the loop
+	// Normalized here as well as at the call sites: this builder is exported and
+	// must not emit the AWS enum spelling regardless of who supplies the value.
+	stopReason = kirocommon.NormalizeStopReason(stopReason)
 	if stopReason == "" {
 		stopReason = "end_turn"
 		if len(toolUses) > 0 {

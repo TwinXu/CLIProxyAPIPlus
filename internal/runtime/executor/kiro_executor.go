@@ -2769,6 +2769,11 @@ func (e *KiroExecutor) parseEventStream(body io.Reader, model string) (string, [
 	// Deduplicate all tool uses
 	toolUses = kiroclaude.DeduplicateToolUses(toolUses)
 
+	// Fold the upstream spelling onto the Anthropic vocabulary before the checks
+	// below inspect it: Kiro reports the AWS enum ("END_TURN", "TOOL_USE"), which
+	// would otherwise reach clients that match the lowercase spec values.
+	stopReason = kirocommon.NormalizeStopReason(stopReason)
+
 	// Apply fallback logic for stop_reason if not provided by upstream
 	// Priority: upstream stopReason > tool_use detection > end_turn default
 	if stopReason == "" {
@@ -4138,8 +4143,9 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 			totalUsage.InputTokens, totalUsage.OutputTokens, totalUsage.TotalTokens)
 	}
 
-	// Determine stop reason: prefer upstream, then detect tool_use, default to end_turn
-	stopReason := upstreamStopReason
+	// Determine stop reason: prefer upstream, then detect tool_use, default to end_turn.
+	// Normalized first — upstream reports the AWS enum spelling.
+	stopReason := kirocommon.NormalizeStopReason(upstreamStopReason)
 	if stopReason == "" {
 		if hasToolUses {
 			stopReason = "tool_use"

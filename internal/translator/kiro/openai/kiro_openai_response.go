@@ -12,6 +12,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
+
+	kirocommon "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/kiro/common"
 )
 
 // functionCallIDCounter provides a process-wide unique counter for function call identifiers.
@@ -118,7 +120,10 @@ func openAIUsagePayload(usageInfo usage.Detail) map[string]interface{} {
 
 // mapKiroStopReasonToOpenAI converts Kiro/Claude stop_reason to OpenAI finish_reason
 func mapKiroStopReasonToOpenAI(stopReason string) string {
-	switch stopReason {
+	// Kiro reports the AWS enum spelling ("TOOL_USE"); without this the switch
+	// falls through to default and emits it verbatim as finish_reason, which no
+	// OpenAI client recognizes.
+	switch kirocommon.NormalizeStopReason(stopReason) {
 	case "end_turn":
 		return "stop"
 	case "stop_sequence":
