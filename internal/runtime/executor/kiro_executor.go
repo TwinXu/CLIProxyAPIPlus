@@ -24,6 +24,7 @@ import (
 	"github.com/google/uuid"
 	kiroauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kiro"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	kiroclaude "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/kiro/claude"
 	kirocommon "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/kiro/common"
@@ -1735,19 +1736,62 @@ func findRealThinkingEndTag(content string, alreadyInCodeBlock, alreadyInInlineC
 // capabilities come from the Kiro registry entries rather than a same-named model
 // on another provider.
 //
-// A validation error is returned to the caller rather than swallowed, matching
-// every other executor. Asking for an effort level the model does not offer --
-// xhigh on claude-opus-4.6, say -- has to be an error: dropping the config here
-// would leave the backend applying its own default, which is the silent
-// substitution this package exists to avoid.
+// How a validation failure is handled depends on who chose the level, because the
+// two cases fail differently.
+//
+// An explicit suffix -- claude-opus-4.6(xhigh) -- is the client naming a strength.
+// The level now reaches the backend, so it genuinely determines the answer, and
+// quietly serving a different one is the silent substitution mapModelToKiro
+// refuses to allow for model names. That is an error.
+//
+// A level derived from another vocabulary is not. An OpenAI reasoning_effort of
+// "minimal" and a Claude budget of 64000 tokens are approximations being mapped
+// into an enum that has no such value; they were never going to be honoured
+// exactly, and rejecting them would break generic clients that never asked for a
+// Kiro-specific level. Those pass through untouched. Nothing unsupported escapes
+// either way: buildKiroAdditionalFields forwards only a level the model's own
+// catalogue entry lists, so an unmapped one simply leaves the backend on its
+// default rather than earning a 400.
 func applyKiroThinking(payload []byte, model string, sourceFormat string) ([]byte, error) {
 	sourceFormat = strings.ToLower(strings.TrimSpace(sourceFormat))
 	if len(payload) == 0 || sourceFormat == "" {
 		return payload, nil
 	}
-	applied, err := thinking.ApplyThinking(payload, model, sourceFormat, sourceFormat, "kiro")
+
+	// Resolve the registry entry through the same name variations mapModelToKiro
+	// accepts, then hand ApplyThinking the id we resolved rather than the string
+	// the client sent. Looking up the raw name would miss every form that routes
+	// but is not spelled like the catalogue entry -- KIRO-CLAUDE-OPUS-5(max),
+	// the -chat and -agentic shapes, and the bare claude-opus-5 -- and a miss
+	// here does not fail loudly, it silently drops the suffix, which is the exact
+	// bug wiring ApplyThinking in was meant to fix.
+	suffix := thinking.ParseSuffix(model)
+	info := registry.LookupKiroModelInfo(suffix.ModelName)
+
+	// A model with no thinking metadata is left completely alone. ApplyThinking
+	// would strip the client's config for these, silently and with no error the
+	// caller could react to. That is not theoretical: every kiro-gpt-5-6-* and
+	// amazonq-* entry routes through this executor in exactly that state, and
+	// stripping also flips the response parser's inline-<thinking> handling off
+	// (see streamToChannel). The same goes for a model no entry describes at all
+	// -- minimax-m2-5 and glm-5 route today with no catalogue entry -- where
+	// applying a config would mean validating against capabilities we invented.
+	if info == nil || info.Thinking == nil {
+		return payload, nil
+	}
+
+	resolved := info.ID
+	if suffix.HasSuffix {
+		resolved = info.ID + "(" + suffix.RawSuffix + ")"
+	}
+
+	applied, err := thinking.ApplyThinking(payload, resolved, sourceFormat, sourceFormat, "kiro")
 	if err != nil {
-		return payload, err
+		if suffix.HasSuffix {
+			return payload, err
+		}
+		log.Debugf("kiro: leaving derived thinking config as-is for %s: %v", model, err)
+		return payload, nil
 	}
 	if len(applied) == 0 {
 		return payload, nil

@@ -12,6 +12,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/google/uuid"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	kirocommon "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/kiro/common"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -28,6 +29,42 @@ type KiroPayload struct {
 	ConversationState KiroConversationState `json:"conversationState"`
 	ProfileArn        string                `json:"profileArn,omitempty"`
 	InferenceConfig   *KiroInferenceConfig  `json:"inferenceConfig,omitempty"`
+	// AdditionalModelRequestFields carries settings the Kiro request shape has no
+	// slot for. The backend validates it against a per-model JSON Schema declared
+	// with additionalProperties:false, so it is only ever populated for models whose
+	// catalogue entry declares the capability -- see buildKiroAdditionalFields.
+	AdditionalModelRequestFields *KiroAdditionalModelRequestFields `json:"additionalModelRequestFields,omitempty"`
+}
+
+// KiroAdditionalModelRequestFields mirrors the backend's
+// additionalModelRequestFieldsSchema for the adaptive-thinking Claude models.
+// The schema also admits max_tokens (1024-128000), which is deliberately not
+// forwarded here: inferenceConfig.maxTokens already carries it, and the schema's
+// 1024 floor would reject the smaller values clients routinely send.
+type KiroAdditionalModelRequestFields struct {
+	OutputConfig *KiroOutputConfig   `json:"output_config,omitempty"`
+	Thinking     *KiroThinkingConfig `json:"thinking,omitempty"`
+}
+
+// KiroOutputConfig carries the adaptive-thinking strength. The accepted values
+// are per-model; the catalogue entry's Thinking.Levels is the source of truth.
+type KiroOutputConfig struct {
+	Effort string `json:"effort"`
+}
+
+// KiroThinkingConfig selects the thinking mode. Type is required by the schema
+// whenever the thinking object is present; "adaptive" and "disabled" are the only
+// accepted values.
+//
+// Display must be set whenever thinking is enabled. Leaving it out does not mean
+// "use the default" -- the backend then behaves as if it were "omitted" and stops
+// emitting reasoningContentEvent entirely, which is strictly worse than sending no
+// additionalModelRequestFields at all. Measured against the live backend on
+// claude-opus-5: no block at all yields 17 reasoning events, {type:adaptive} alone
+// yields 0, and {type:adaptive,display:summarized} restores 17.
+type KiroThinkingConfig struct {
+	Type    string `json:"type"`
+	Display string `json:"display,omitempty"`
 }
 
 // KiroInferenceConfig contains inference parameters for the Kiro API.
@@ -206,6 +243,13 @@ func BuildKiroPayload(claudeBody []byte, modelID, profileArn, origin string, isA
 		}
 	}
 
+	// Capture the adaptive-thinking configuration before the strip below removes it:
+	// Kiro carries it out of band in additionalModelRequestFields, not in the
+	// Claude-shaped body.
+	additionalFields := BuildKiroAdditionalFields(modelID,
+		strings.ToLower(strings.TrimSpace(gjson.GetBytes(claudeBody, "output_config.effort").String())),
+		thinkingEnabled)
+
 	// Strip Claude-specific fields not supported by Kiro API.
 	// Must be done AFTER thinking detection above (IsThinkingEnabledWithHeaders reads "thinking").
 	// Matches the same treatment in Codex (codex_claude_request.go:258-259)
@@ -344,8 +388,9 @@ func BuildKiroPayload(claudeBody []byte, modelID, profileArn, origin string, isA
 			CurrentMessage:  currentMessage,
 			History:         history,
 		},
-		ProfileArn:      profileArn,
-		InferenceConfig: inferenceConfig,
+		ProfileArn:                   profileArn,
+		InferenceConfig:              inferenceConfig,
+		AdditionalModelRequestFields: additionalFields,
 	}
 
 	// Only set AgentContinuationID if client provided
@@ -360,6 +405,47 @@ func BuildKiroPayload(claudeBody []byte, modelID, profileArn, origin string, isA
 	}
 
 	return result, thinkingEnabled
+}
+
+// BuildKiroAdditionalFields decides what, if anything, to send in
+// additionalModelRequestFields.
+//
+// The backend validates this object against a per-model JSON Schema declared with
+// additionalProperties:false, and rejects the whole request with 400 when a field
+// or an effort value is not in that model's schema. So the block is emitted only
+// for a model whose catalogue entry declares discrete effort levels, and an effort
+// is attached only when that entry lists it.
+//
+// Nothing is emitted when thinking is off, which keeps a non-thinking request on
+// exactly the wire shape it has today. When thinking is on but no effort was
+// resolved, the mode is still sent on its own and the backend applies the schema's
+// own effort default.
+func BuildKiroAdditionalFields(modelID, effort string, thinkingEnabled bool) *KiroAdditionalModelRequestFields {
+	if !thinkingEnabled {
+		return nil
+	}
+	info := registry.LookupKiroModelInfo(modelID)
+	if info == nil || info.Thinking == nil || len(info.Thinking.Levels) == 0 {
+		return nil
+	}
+
+	fields := &KiroAdditionalModelRequestFields{
+		Thinking: &KiroThinkingConfig{Type: "adaptive", Display: "summarized"},
+	}
+	for _, level := range info.Thinking.Levels {
+		if strings.EqualFold(strings.TrimSpace(level), effort) {
+			fields.OutputConfig = &KiroOutputConfig{Effort: strings.ToLower(strings.TrimSpace(level))}
+			break
+		}
+	}
+	if fields.OutputConfig == nil && effort != "" {
+		// applyKiroThinking validates the level against this same list before the
+		// request gets here, so a mismatch means the effort was written by
+		// something else -- a hand-rolled body, or a model whose entry declares no
+		// thinking. Forwarding it would earn a 400 naming the enum.
+		log.Debugf("kiro: effort %q not offered by %s, sending adaptive thinking without it", effort, modelID)
+	}
+	return fields
 }
 
 // normalizeOrigin normalizes origin value for Kiro API compatibility

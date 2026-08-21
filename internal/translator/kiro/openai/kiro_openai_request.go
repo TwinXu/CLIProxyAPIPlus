@@ -25,6 +25,11 @@ type KiroPayload struct {
 	ConversationState KiroConversationState `json:"conversationState"`
 	ProfileArn        string                `json:"profileArn,omitempty"`
 	InferenceConfig   *KiroInferenceConfig  `json:"inferenceConfig,omitempty"`
+	// AdditionalModelRequestFields carries the adaptive-thinking settings the Kiro
+	// request shape has no slot for. The type and the decision of what to put in it
+	// are shared with the Claude builder so both surfaces obey the one per-model
+	// schema the backend validates against.
+	AdditionalModelRequestFields *kiroclaude.KiroAdditionalModelRequestFields `json:"additionalModelRequestFields,omitempty"`
 }
 
 // KiroInferenceConfig contains inference parameters for the Kiro API.
@@ -316,6 +321,12 @@ func BuildKiroPayloadFromOpenAI(openaiBody []byte, modelID, profileArn, origin s
 		},
 		ProfileArn:      profileArn,
 		InferenceConfig: inferenceConfig,
+		// applyKiroThinking has already normalised reasoning_effort against this
+		// model's declared levels; anything it could not map is filtered out again
+		// inside BuildKiroAdditionalFields rather than forwarded.
+		AdditionalModelRequestFields: kiroclaude.BuildKiroAdditionalFields(modelID,
+			strings.ToLower(strings.TrimSpace(gjson.GetBytes(openaiBody, "reasoning_effort").String())),
+			thinkingEnabled),
 	}
 
 	// Only set AgentContinuationID if client provided
