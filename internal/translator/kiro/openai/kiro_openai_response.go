@@ -123,7 +123,8 @@ func mapKiroStopReasonToOpenAI(stopReason string) string {
 	// Kiro reports the AWS enum spelling ("TOOL_USE"); without this the switch
 	// falls through to default and emits it verbatim as finish_reason, which no
 	// OpenAI client recognizes.
-	switch kirocommon.NormalizeStopReason(stopReason) {
+	normalized := kirocommon.NormalizeStopReason(stopReason)
+	switch normalized {
 	case "end_turn":
 		return "stop"
 	case "stop_sequence":
@@ -135,7 +136,10 @@ func mapKiroStopReasonToOpenAI(stopReason string) string {
 	case "content_filtered":
 		return "content_filter"
 	default:
-		return stopReason
+		// The normalized spelling, not the raw one: returning stopReason here
+		// put the AWS enum straight back on the wire for every reason the
+		// switch does not name, which is the bug the switch exists to avoid.
+		return normalized
 	}
 }
 

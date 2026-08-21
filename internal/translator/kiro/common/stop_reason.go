@@ -2,6 +2,30 @@ package common
 
 import "strings"
 
+// stopReasonSpellings maps a stop reason, folded to lowercase with every
+// separator removed, onto its Anthropic Messages API spelling.
+//
+// The key is separator-free on purpose: the same reason reaches us in at least
+// three spellings depending on which upstream surface produced it — the AWS
+// enum ("END_TURN"), the Converse camelCase ("endTurn"), and the spec spelling
+// itself ("end_turn"). Folding the separators out collapses all three onto one
+// key, so a reason needs exactly one entry here instead of one per spelling.
+//
+// Single-word reasons ("refusal") need no entry: lowercasing alone already
+// produces the spec spelling, and the fallthrough returns it unchanged.
+var stopReasonSpellings = map[string]string{
+	"endturn":                    "end_turn",
+	"tooluse":                    "tool_use",
+	"maxtokens":                  "max_tokens",
+	"stopsequence":               "stop_sequence",
+	"pauseturn":                  "pause_turn",
+	"contentfiltered":            "content_filtered",
+	"guardrailintervened":        "guardrail_intervened",
+	"modelcontextwindowexceeded": "model_context_window_exceeded",
+}
+
+var stopReasonSeparators = strings.NewReplacer("_", "", "-", "", " ", "")
+
 // NormalizeStopReason maps an upstream Kiro/CodeWhisperer stop reason onto the
 // Anthropic Messages API vocabulary.
 //
@@ -13,23 +37,13 @@ import "strings"
 // so every stop reason is folded to its spec spelling here before it reaches a
 // response builder.
 //
-// Unrecognized values are lowercased rather than replaced: downstream mappers
-// (e.g. "content_filtered" -> OpenAI "content_filter") own their own vocabulary,
-// and dropping an unknown reason would hide it from them.
+// Reasons outside the table are lowercased but otherwise returned as they came:
+// downstream mappers own their own vocabulary, and dropping an unknown reason
+// would hide it from them.
 func NormalizeStopReason(stopReason string) string {
 	normalized := strings.ToLower(strings.TrimSpace(stopReason))
-	switch normalized {
-	case "endturn":
-		return "end_turn"
-	case "tooluse":
-		return "tool_use"
-	case "maxtokens":
-		return "max_tokens"
-	case "stopsequence":
-		return "stop_sequence"
-	case "pauseturn":
-		return "pause_turn"
-	default:
-		return normalized
+	if spelled, ok := stopReasonSpellings[stopReasonSeparators.Replace(normalized)]; ok {
+		return spelled
 	}
+	return normalized
 }
