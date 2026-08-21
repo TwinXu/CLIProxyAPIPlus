@@ -3,21 +3,12 @@
 // and merging with static metadata for thinking support and other capabilities.
 package registry
 
-// DefaultKiroThinkingSupport defines the default thinking configuration for Kiro models.
-// All Kiro models support thinking with the following budget range.
-var DefaultKiroThinkingSupport = &ThinkingSupport{
-	Min:            1024,  // Minimum thinking budget tokens
-	Max:            32000, // Maximum thinking budget tokens
-	ZeroAllowed:    true,  // Allow disabling thinking with 0
-	DynamicAllowed: true,  // Allow dynamic thinking budget (-1)
-}
-
 // Capability numbers for the Claude 4.6-and-newer generation on Kiro, as
 // reported by ListAvailableModels on the Kiro backend. Read them yourself with:
 //
 //	go run ./cmd/kiroprobe -token <auth file> -model claude
 //
-// Recorded 2026-08-20. The Default* values above describe the Claude 4.5-era
+// Recorded 2026-08-20. The DefaultKiro* values below describe the Claude 4.5-era
 // backend and understate this generation on every axis, which is why these exist
 // separately rather than as new defaults. Re-probe when a new model lands: the
 // backend is the only authority for these, and a guess here silently misreports

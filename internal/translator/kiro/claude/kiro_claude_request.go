@@ -518,8 +518,10 @@ func checkThinkingMode(claudeBody []byte) (bool, int64, bool) {
 			}
 		case "adaptive", "auto":
 			// Adaptive/auto thinking (Claude 4.6+): enable thinking mode.
-			// output_config.effort and context_management are not forwarded to Kiro API
-			// (Kiro payload is built as a new struct; incompatible fields are naturally excluded).
+			// The Claude-shaped output_config and thinking fields are stripped further
+			// down, but the strength is not lost with them: BuildKiroAdditionalFields
+			// re-emits it as additionalModelRequestFields, which is where this backend
+			// reads it. context_management has no such channel and really is dropped.
 			thinkingEnabled = true
 			log.Debugf("kiro: thinking mode enabled via adaptive/auto thinking type")
 		case "disabled":
