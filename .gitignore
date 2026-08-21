@@ -1,6 +1,9 @@
 # Binaries
-cli-proxy-api
-cliproxy
+# Anchored to the repo root: these name built binaries, but unanchored they
+# match any path component, and "cliproxy" was silently ignoring every new
+# file added under sdk/cliproxy/ (the 49 tracked files there predate it).
+/cli-proxy-api
+/cliproxy
 /server
 *.exe
 
