@@ -77,3 +77,31 @@ func TestConvertKiroNonStreamToOpenAICarriesNativeReasoning(t *testing.T) {
 		t.Fatalf("content = %q, want the text block only", got)
 	}
 }
+
+func TestMapKiroStopReasonToOpenAI(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		// The spellings Kiro actually sends.
+		{"TOOL_USE", "tool_calls"},
+		{"END_TURN", "stop"},
+		{"MAX_TOKENS", "length"},
+		{"STOP_SEQUENCE", "stop"},
+		{"CONTENT_FILTERED", "content_filter"},
+		// A reason the switch does not name still leaves as the spec spelling.
+		// The default branch used to return the raw argument, which handed the
+		// AWS enum straight to an OpenAI client as finish_reason.
+		{"PAUSE_TURN", "pause_turn"},
+		{"GUARDRAIL_INTERVENED", "guardrail_intervened"},
+		// Crosses both fixes: the camelCase spelling has to fold onto
+		// "content_filtered" before this switch can recognize it at all.
+		{"contentFiltered", "content_filter"},
+		{"", ""},
+	}
+	for _, tc := range tests {
+		if got := mapKiroStopReasonToOpenAI(tc.in); got != tc.want {
+			t.Errorf("mapKiroStopReasonToOpenAI(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
