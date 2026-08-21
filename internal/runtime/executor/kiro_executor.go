@@ -35,6 +35,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 	"golang.org/x/net/http2"
 )
 
@@ -754,6 +755,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 	// cooldownMgr := kiroauth.GetGlobalCooldownManager()
 	endpointConfigs := getKiroEndpointConfigs(auth)
 	var last429Err error
+	var lastModelErr error
 
 	for endpointIdx := 0; endpointIdx < len(endpointConfigs); endpointIdx++ {
 		endpointConfig := endpointConfigs[endpointIdx]
@@ -1020,6 +1022,11 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 				if errClose := httpResp.Body.Close(); errClose != nil {
 					log.Errorf("response body close error: %v", errClose)
 				}
+				if httpResp.StatusCode == 400 && isKiroModelUnavailableAtEndpoint(b) {
+					lastModelErr = err
+					log.Warnf("kiro: %s does not serve model %s, trying next endpoint", endpointConfig.Name, kiroModelID)
+					break
+				}
 				return resp, err
 			}
 
@@ -1099,6 +1106,9 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 	// All endpoints exhausted
 	if last429Err != nil {
 		return resp, last429Err
+	}
+	if lastModelErr != nil {
+		return resp, lastModelErr
 	}
 	return resp, fmt.Errorf("kiro: all endpoints exhausted")
 }
@@ -1224,6 +1234,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 	// cooldownMgr := kiroauth.GetGlobalCooldownManager()
 	endpointConfigs := getKiroEndpointConfigs(auth)
 	var last429Err error
+	var lastModelErr error
 
 	for endpointIdx := 0; endpointIdx < len(endpointConfigs); endpointIdx++ {
 		endpointConfig := endpointConfigs[endpointIdx]
@@ -1376,7 +1387,14 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 				log.Warnf("kiro: 400 error - sent payload: %s", string(kiroPayload))
 				log.Warnf("kiro: received 400 error (attempt %d/%d), body: %s", attempt+1, maxRetries+1, summarizeErrorBody(httpResp.Header.Get("Content-Type"), respBody))
 
-				// 400 errors indicate request validation issues - return immediately without retry
+				// INVALID_MODEL_ID is the one 400 that another endpoint may not give.
+				if isKiroModelUnavailableAtEndpoint(respBody) {
+					lastModelErr = statusErr{code: httpResp.StatusCode, msg: string(respBody)}
+					log.Warnf("kiro: stream: %s does not serve model %s, trying next endpoint", endpointConfig.Name, kiroModelID)
+					break
+				}
+
+				// Other 400 errors indicate request validation issues - return immediately without retry
 				return nil, statusErr{code: httpResp.StatusCode, msg: string(respBody)}
 			}
 
@@ -1535,7 +1553,24 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 	if last429Err != nil {
 		return nil, last429Err
 	}
+	if lastModelErr != nil {
+		return nil, lastModelErr
+	}
 	return nil, fmt.Errorf("kiro: stream all endpoints exhausted")
+}
+
+// isKiroModelUnavailableAtEndpoint reports whether a 400 body says this endpoint
+// does not serve the requested model.
+//
+// The endpoints in buildKiroEndpointConfigs do not all carry the same catalogue,
+// and the primary runtime.*.kiro.dev endpoint has been observed rejecting a model
+// it serves normally minutes later -- a rollout that had not reached every cell.
+// INVALID_MODEL_ID means "not here", not "your request is malformed", so it is the
+// one 400 worth retrying against the remaining endpoints instead of returning to
+// the client. Every other 400 is a validation problem that the next endpoint would
+// reject in exactly the same way.
+func isKiroModelUnavailableAtEndpoint(respBody []byte) bool {
+	return gjson.GetBytes(respBody, "reason").String() == "INVALID_MODEL_ID"
 }
 
 // kiroCredentials extracts access token and profile ARN from auth.
