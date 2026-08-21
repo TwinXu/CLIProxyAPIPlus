@@ -3068,6 +3068,24 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 	var accumulatedThinkingContent strings.Builder // Accumulate thinking content for token counting
 	hasOfficialReasoningEvent := false             // Disable tag parsing after official reasoning events appear
 
+	// closeThinkingBlockIfOpen emits the content_block_stop that pairs with an open
+	// thinking block. Every site that opens a following block must call it first, as
+	// must the end-of-stream finalizer: a content_block_start with no matching stop is
+	// a malformed stream for clients that track block lifetimes, and the native
+	// reasoningContentEvent path (used by the current Claude models) opens a thinking
+	// block that the tag-based parser below never closes on its own.
+	closeThinkingBlockIfOpen := func() {
+		if !isThinkingBlockOpen {
+			return
+		}
+		blockStop := kiroclaude.BuildClaudeThinkingBlockStopEvent(thinkingBlockIndex)
+		sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStop, &translatorParam)
+		for _, chunk := range sseData {
+			enqueueTranslatedSSE(out, chunk)
+		}
+		isThinkingBlockOpen = false
+	}
+
 	// Buffer for handling partial tag matches at chunk boundaries
 	var pendingContent strings.Builder // Buffer content that might be part of a tag
 
@@ -3502,6 +3520,9 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 					processText := strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(contentDelta, kirocommon.ThinkingStartTag, ""), kirocommon.ThinkingEndTag, ""))
 					if processText != "" {
 						if !isTextBlockOpen {
+							// A native reasoningContentEvent stream leaves a thinking block open;
+							// it must be stopped before this text block starts.
+							closeThinkingBlockIfOpen()
 							contentBlockIndex++
 							isTextBlockOpen = true
 							blockStart := kiroclaude.BuildClaudeContentBlockStartEvent(contentBlockIndex, "text", "", "")
@@ -3554,14 +3575,7 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 								accumulatedThinkingContent.WriteString(thinkingText)
 							}
 							// Close thinking block
-							if isThinkingBlockOpen {
-								blockStop := kiroclaude.BuildClaudeThinkingBlockStopEvent(thinkingBlockIndex)
-								sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStop, &translatorParam)
-								for _, chunk := range sseData {
-									enqueueTranslatedSSE(out, chunk)
-								}
-								isThinkingBlockOpen = false
-							}
+							closeThinkingBlockIfOpen()
 							inThinkBlock = false
 							processContent = processContent[endIdx+len(kirocommon.ThinkingEndTag):]
 							log.Debugf("kiro: closed thinking block, remaining content: %d chars", len(processContent))
@@ -3608,14 +3622,7 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 							textBefore := processContent[:startIdx]
 							if textBefore != "" {
 								// Close thinking block if open
-								if isThinkingBlockOpen {
-									blockStop := kiroclaude.BuildClaudeThinkingBlockStopEvent(thinkingBlockIndex)
-									sseData := sdktranslator.TranslateStream(ctx, sdktranslator.FromString("kiro"), targetFormat, model, originalReq, claudeBody, blockStop, &translatorParam)
-									for _, chunk := range sseData {
-										enqueueTranslatedSSE(out, chunk)
-									}
-									isThinkingBlockOpen = false
-								}
+								closeThinkingBlockIfOpen()
 								// Ensure text block is open
 								if !isTextBlockOpen {
 									contentBlockIndex++
@@ -3695,6 +3702,7 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 				processedIDs[toolUseID] = true
 
 				hasToolUses = true
+				closeThinkingBlockIfOpen()
 				// Close text block if open before starting tool_use block
 				if isTextBlockOpen && contentBlockIndex >= 0 {
 					blockStop := kiroclaude.BuildClaudeContentBlockStopEvent(contentBlockIndex)
@@ -3821,6 +3829,7 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 
 				hasToolUses = true
 
+				closeThinkingBlockIfOpen()
 				// Close text block if open
 				if isTextBlockOpen && contentBlockIndex >= 0 {
 					blockStop := kiroclaude.BuildClaudeContentBlockStopEvent(contentBlockIndex)
@@ -4051,6 +4060,10 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 			}
 		}
 	}
+
+	// Close any block still open. A stream that ends on reasoning alone (no text,
+	// no tool call) leaves only the thinking block to close.
+	closeThinkingBlockIfOpen()
 
 	// Close content block if open
 	if isTextBlockOpen && contentBlockIndex >= 0 {
