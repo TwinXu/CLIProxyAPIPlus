@@ -167,3 +167,36 @@ func TestKiroStreamNormalizesStopReason(t *testing.T) {
 	}
 	t.Fatalf("no message_delta event found in:\n%s", body)
 }
+
+// streamOutputTokens reads the output_tokens the stream reported in message_delta.
+func streamOutputTokens(t *testing.T, body string) float64 {
+	t.Helper()
+	for _, ev := range sseEvents(t, body) {
+		if ev["type"] != "message_delta" {
+			continue
+		}
+		if u, ok := ev["usage"].(map[string]any); ok {
+			tokens, _ := u["output_tokens"].(float64)
+			return tokens
+		}
+	}
+	t.Fatalf("no message_delta usage found in:\n%s", body)
+	return 0
+}
+
+// Reasoning is billed as output. accumulatedThinkingContent was declared "for token
+// counting" and had no reader, so a stream whose answer was mostly reasoning reported
+// a fraction of the tokens the buffered path would have. Upstream normally sends
+// tokenUsage and this estimate never runs; these frames deliberately omit it.
+func TestKiroStreamBillsReasoningAsOutput(t *testing.T) {
+	answer := kiroFrame("assistantResponseEvent", `{"assistantResponseEvent":{"content":"391."}}`)
+	reasoning := kiroFrame("reasoningContentEvent",
+		`{"reasoningContentEvent":{"text":"`+strings.Repeat("Weighing the options. ", 20)+`"}}`)
+
+	withReasoning := streamOutputTokens(t, runKiroStream(t, reasoning, answer))
+	answerOnly := streamOutputTokens(t, runKiroStream(t, answer))
+
+	if withReasoning <= answerOnly {
+		t.Fatalf("output_tokens with reasoning = %v, without = %v; want the reasoning counted", withReasoning, answerOnly)
+	}
+}

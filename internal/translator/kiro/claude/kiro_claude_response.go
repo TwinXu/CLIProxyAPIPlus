@@ -34,23 +34,71 @@ var (
 	thinkingEndTag   = kirocommon.ThinkingEndTag
 )
 
+// NativeReasoning is the reasoning a Kiro backend produced as reasoningContentEvent,
+// as opposed to the legacy <thinking> tags some older models embedded in their text.
+type NativeReasoning struct {
+	// Text is every reasoning event's text concatenated, in arrival order.
+	Text string
+	// Signature is the last signature the backend attached to a reasoning event.
+	// Empty when it attached none, in which case a local one is derived.
+	Signature string
+	// Present records that a reasoning event arrived at all, even an empty one.
+	// It is what disqualifies the <thinking> tag scan, so it must not be inferred
+	// from Text being non-empty.
+	Present bool
+}
+
 // BuildClaudeResponse constructs a Claude-compatible response.
 // Supports tool_use blocks when tools are present in the response.
 // Supports thinking blocks - parses <thinking> tags and converts to Claude thinking content blocks.
 // stopReason is passed from upstream; fallback logic applied if empty.
 func BuildClaudeResponse(content string, toolUses []KiroToolUse, model string, usageInfo usage.Detail, stopReason string) []byte {
+	return BuildClaudeResponseWithReasoning(content, NativeReasoning{}, toolUses, model, usageInfo, stopReason)
+}
+
+// BuildClaudeResponseWithReasoning is BuildClaudeResponse with the backend's native
+// reasoning attached as a leading thinking block.
+//
+// The two reasoning sources are mutually exclusive by construction, so the presence of
+// a native one also turns the tag scan off: a backend that emits reasoningContentEvent
+// never writes <thinking> tags, which makes any tag left in the text the model's own
+// prose. The streaming reader draws the same line with hasOfficialReasoningEvent.
+func BuildClaudeResponseWithReasoning(content string, reasoning NativeReasoning, toolUses []KiroToolUse, model string, usageInfo usage.Detail, stopReason string) []byte {
 	var contentBlocks []map[string]interface{}
+
+	// Any text at all becomes the block: dropping whitespace-only reasoning here while
+	// Present below still suppresses the tag scan would lose both sources at once.
+	if reasoning.Text != "" {
+		signature := reasoning.Signature
+		if signature == "" {
+			signature = generateThinkingSignature(reasoning.Text)
+		}
+		contentBlocks = append(contentBlocks, map[string]interface{}{
+			"type":      "thinking",
+			"thinking":  reasoning.Text,
+			"signature": signature,
+		})
+		log.Infof("kiro: buildClaudeResponse attached native reasoning block (len: %d, upstream signature: %t)",
+			len(reasoning.Text), reasoning.Signature != "")
+	}
 
 	// Extract thinking blocks and text from content
 	if content != "" {
-		blocks := ExtractThinkingFromContent(content)
-		contentBlocks = append(contentBlocks, blocks...)
+		if reasoning.Present {
+			contentBlocks = append(contentBlocks, map[string]interface{}{
+				"type": "text",
+				"text": content,
+			})
+		} else {
+			blocks := ExtractThinkingFromContent(content)
+			contentBlocks = append(contentBlocks, blocks...)
 
-		// Log if thinking blocks were extracted
-		for _, block := range blocks {
-			if block["type"] == "thinking" {
-				thinkingContent := block["thinking"].(string)
-				log.Infof("kiro: buildClaudeResponse extracted thinking block (len: %d)", len(thinkingContent))
+			// Log if thinking blocks were extracted
+			for _, block := range blocks {
+				if block["type"] == "thinking" {
+					thinkingContent := block["thinking"].(string)
+					log.Infof("kiro: buildClaudeResponse extracted thinking block (len: %d)", len(thinkingContent))
+				}
 			}
 		}
 	}

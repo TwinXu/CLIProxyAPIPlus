@@ -297,10 +297,11 @@ func TestParseEventStream_KiroCacheUsageDoesNotDoubleCountInput(t *testing.T) {
 	}`))
 
 	executor := &KiroExecutor{}
-	_, _, usageInfo, _, _, _, err := executor.parseEventStream(bytes.NewReader(stream.Bytes()), "claude-sonnet-4.5")
+	parsed, err := executor.parseEventStream(bytes.NewReader(stream.Bytes()), "claude-sonnet-4.5")
 	if err != nil {
 		t.Fatalf("parseEventStream() error = %v", err)
 	}
+	usageInfo := parsed.Usage
 	if usageInfo.InputTokens != 10 {
 		t.Fatalf("InputTokens = %d, want uncached input 10", usageInfo.InputTokens)
 	}
@@ -960,10 +961,11 @@ func TestParseEventStream_DoesNotInferCacheFromGenericTotalTokens(t *testing.T) 
 	}`))
 
 	executor := &KiroExecutor{}
-	_, _, usageInfo, _, _, _, err := executor.parseEventStream(bytes.NewReader(stream.Bytes()), "claude-sonnet-4.5")
+	parsed, err := executor.parseEventStream(bytes.NewReader(stream.Bytes()), "claude-sonnet-4.5")
 	if err != nil {
 		t.Fatalf("parseEventStream() error = %v", err)
 	}
+	usageInfo := parsed.Usage
 	if usageInfo.CacheReadInputTokens != 0 {
 		t.Fatalf("CacheReadInputTokens = %d, want no inference from generic totalTokens", usageInfo.CacheReadInputTokens)
 	}
@@ -994,10 +996,12 @@ func TestParseEventStream_EstimatesCacheFromCredits(t *testing.T) {
 	}`))
 
 	executor := &KiroExecutor{}
-	_, _, usageInfo, _, estCR, estCW, err := executor.parseEventStream(bytes.NewReader(stream.Bytes()), "claude-sonnet-4.5")
+	parsed, err := executor.parseEventStream(bytes.NewReader(stream.Bytes()), "claude-sonnet-4.5")
 	if err != nil {
 		t.Fatalf("parseEventStream() error = %v", err)
 	}
+	usageInfo := parsed.Usage
+	estCR, estCW := parsed.EstimatedCacheRead, parsed.EstimatedCacheWrite
 	if !estCR || !estCW {
 		t.Fatalf("estimatedCR=%t estimatedCW=%t, want both true (credits + total + no official cache)", estCR, estCW)
 	}
@@ -1044,10 +1048,11 @@ func TestParseEventStream_UsageEventDoesNotOverwriteUncachedInput(t *testing.T) 
 	}`))
 
 	executor := &KiroExecutor{}
-	_, _, usageInfo, _, _, _, err := executor.parseEventStream(bytes.NewReader(stream.Bytes()), "claude-sonnet-4.5")
+	parsed, err := executor.parseEventStream(bytes.NewReader(stream.Bytes()), "claude-sonnet-4.5")
 	if err != nil {
 		t.Fatalf("parseEventStream() error = %v", err)
 	}
+	usageInfo := parsed.Usage
 	if usageInfo.InputTokens != 2 {
 		t.Fatalf("InputTokens = %d, want uncached 2 (usageEvent must not overwrite)", usageInfo.InputTokens)
 	}
@@ -1073,10 +1078,11 @@ func TestParseEventStream_TotalTokensFallbackIncludesCache(t *testing.T) {
 	}`))
 
 	executor := &KiroExecutor{}
-	_, _, usageInfo, _, _, _, err := executor.parseEventStream(bytes.NewReader(stream.Bytes()), "claude-sonnet-4.5")
+	parsed, err := executor.parseEventStream(bytes.NewReader(stream.Bytes()), "claude-sonnet-4.5")
 	if err != nil {
 		t.Fatalf("parseEventStream() error = %v", err)
 	}
+	usageInfo := parsed.Usage
 	// In executeWithRetry the TotalTokens fallback adds CachedTokens; replicate
 	// that step here since parseEventStream itself leaves TotalTokens at 0 when
 	// upstream did not provide totalTokens.
@@ -1109,10 +1115,11 @@ func TestParseEventStream_SupplementaryWebLinksDoesNotOverwriteUncachedInput(t *
 	}`))
 
 	executor := &KiroExecutor{}
-	_, _, usageInfo, _, _, _, err := executor.parseEventStream(bytes.NewReader(stream.Bytes()), "claude-sonnet-4.5")
+	parsed, err := executor.parseEventStream(bytes.NewReader(stream.Bytes()), "claude-sonnet-4.5")
 	if err != nil {
 		t.Fatalf("parseEventStream() error = %v", err)
 	}
+	usageInfo := parsed.Usage
 	if usageInfo.InputTokens != 2 {
 		t.Fatalf("InputTokens = %d, want uncached 2 (supplementaryWebLinksEvent must not overwrite)", usageInfo.InputTokens)
 	}
@@ -1143,10 +1150,11 @@ func TestParseEventStream_LegacyMetadataDoesNotOverwriteAllCached(t *testing.T) 
 	}`))
 
 	executor := &KiroExecutor{}
-	_, _, usageInfo, _, _, _, err := executor.parseEventStream(bytes.NewReader(stream.Bytes()), "claude-sonnet-4.5")
+	parsed, err := executor.parseEventStream(bytes.NewReader(stream.Bytes()), "claude-sonnet-4.5")
 	if err != nil {
 		t.Fatalf("parseEventStream() error = %v", err)
 	}
+	usageInfo := parsed.Usage
 	if usageInfo.InputTokens != 0 {
 		t.Fatalf("InputTokens = %d, want 0 (all-cached scenario, legacy fallback must not overwrite)", usageInfo.InputTokens)
 	}

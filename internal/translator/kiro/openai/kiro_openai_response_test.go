@@ -58,3 +58,22 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input
 		t.Fatalf("cached_tokens = %d, want 10", got)
 	}
 }
+
+// The OpenAI surface derives reasoning_content from the Claude response's thinking
+// blocks, so a non-streaming Kiro response that carries the backend's native
+// reasoning has to arrive with it rather than dropped alongside it.
+func TestConvertKiroNonStreamToOpenAICarriesNativeReasoning(t *testing.T) {
+	claudeResponse := []byte(`{"type":"message","role":"assistant","model":"kiro-claude-opus-5",` +
+		`"content":[{"type":"thinking","thinking":"Weighing the options.","signature":"sig"},` +
+		`{"type":"text","text":"Here you go."}],"stop_reason":"end_turn",` +
+		`"usage":{"input_tokens":10,"output_tokens":5}}`)
+
+	out := ConvertKiroNonStreamToOpenAI(context.Background(), "kiro-claude-opus-5", nil, nil, claudeResponse, nil)
+
+	if got := gjson.GetBytes(out, "choices.0.message.reasoning_content").String(); got != "Weighing the options." {
+		t.Fatalf("reasoning_content = %q, want the thinking block", got)
+	}
+	if got := gjson.GetBytes(out, "choices.0.message.content").String(); got != "Here you go." {
+		t.Fatalf("content = %q, want the text block only", got)
+	}
+}

@@ -1036,11 +1036,16 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 				}
 			}()
 
-			content, toolUses, usageInfo, stopReason, estimatedCacheRead, estimatedCacheWrite, err := e.parseEventStream(httpResp.Body, req.Model)
+			parsed, err := e.parseEventStream(httpResp.Body, req.Model)
 			if err != nil {
 				recordAPIResponseError(ctx, e.cfg, err)
 				return resp, err
 			}
+			content := parsed.Content
+			toolUses := parsed.ToolUses
+			usageInfo := parsed.Usage
+			stopReason := parsed.StopReason
+			estimatedCacheRead, estimatedCacheWrite := parsed.EstimatedCacheRead, parsed.EstimatedCacheWrite
 
 			// Fallback for usage if missing from upstream
 
@@ -1057,17 +1062,20 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 				}
 			}
 
-			// 2. Estimate OutputTokens if missing and content is available
-			if usageInfo.OutputTokens == 0 && len(content) > 0 {
+			// 2. Estimate OutputTokens if missing and content is available.
+			//    Reasoning is billed as output as well, so it is counted alongside
+			//    the visible text rather than left out of the estimate.
+			if usageInfo.OutputTokens == 0 && len(parsed.Reasoning.Text)+len(content) > 0 {
+				billed := parsed.Reasoning.Text + content
 				// Use tiktoken for more accurate output token calculation
 				if enc, encErr := getTokenizer(req.Model); encErr == nil {
-					if tokenCount, countErr := enc.Count(content); countErr == nil {
+					if tokenCount, countErr := enc.Count(billed); countErr == nil {
 						usageInfo.OutputTokens = int64(tokenCount)
 					}
 				}
 				// Fallback to character count estimation if tiktoken fails
 				if usageInfo.OutputTokens == 0 {
-					usageInfo.OutputTokens = int64(len(content) / 4)
+					usageInfo.OutputTokens = int64(len(billed) / 4)
 					if usageInfo.OutputTokens == 0 {
 						usageInfo.OutputTokens = 1
 					}
@@ -1081,7 +1089,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 				usageInfo.TotalTokens = usageInfo.InputTokens + usageInfo.OutputTokens + usageInfo.CachedTokens
 			}
 
-			appendAPIResponseChunk(ctx, e.cfg, []byte(content))
+			appendAPIResponseChunk(ctx, e.cfg, []byte(parsed.Reasoning.Text+content))
 			reporter.publish(ctx, usageDetailForInternalStats(usageInfo, estimatedCacheRead, estimatedCacheWrite))
 
 			// Record success for rate limiting
@@ -1093,7 +1101,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 			// Build response in Claude format for Kiro translator
 			// stopReason is extracted from upstream response by parseEventStream
 			requestedModel := payloadRequestedModel(opts, req.Model)
-			kiroResponse := kiroclaude.BuildClaudeResponse(content, toolUses, requestedModel, usageInfo, stopReason)
+			kiroResponse := kiroclaude.BuildClaudeResponseWithReasoning(content, parsed.Reasoning, toolUses, requestedModel, usageInfo, stopReason)
 			out := sdktranslator.TranslateNonStream(ctx, to, from, requestedModel, bytes.Clone(opts.OriginalRequest), body, kiroResponse, nil)
 			resp = cliproxyexecutor.Response{Payload: []byte(out)}
 			return resp, nil
@@ -2374,12 +2382,41 @@ type eventStreamMessage struct {
 // NOTE: Request building functions moved to internal/translator/kiro/claude/kiro_claude_request.go
 // The executor now uses kiroclaude.BuildKiroPayload() instead
 
+// kiroNonStreamResult is everything parseEventStream extracts from a buffered Kiro
+// event stream. It replaces a seven-value return list that had no room left for the
+// native reasoning fields.
+type kiroNonStreamResult struct {
+	Content    string
+	ToolUses   []kiroclaude.KiroToolUse
+	Usage      usage.Detail
+	StopReason string
+
+	// Reasoning is what the backend produced as reasoningContentEvent.
+	Reasoning kiroclaude.NativeReasoning
+
+	EstimatedCacheRead  bool
+	EstimatedCacheWrite bool
+}
+
+// parseKiroReasoningEvent pulls the text and signature out of a reasoningContentEvent.
+// The documented shape is {"reasoningContentEvent":{"text":...,"signature":...}}, but the
+// same fields also arrive unwrapped, so both are accepted. Shared with the streaming
+// reader so the two cannot drift apart.
+func parseKiroReasoningEvent(event map[string]interface{}) (text, signature string) {
+	if re, ok := event["reasoningContentEvent"].(map[string]interface{}); ok {
+		return kirocommon.GetString(re, "text"), kirocommon.GetString(re, "signature")
+	}
+	return kirocommon.GetString(event, "text"), kirocommon.GetString(event, "signature")
+}
+
 // parseEventStream parses AWS Event Stream binary format.
-// Extracts text content, tool uses, and stop_reason from the response.
+// Extracts text content, native reasoning, tool uses, and stop_reason from the response.
 // Supports embedded [Called ...] tool calls and input buffering for toolUseEvent.
-// Returns: content, toolUses, usageInfo, stopReason, estimatedCacheRead, estimatedCacheWrite, error
-func (e *KiroExecutor) parseEventStream(body io.Reader, model string) (string, []kiroclaude.KiroToolUse, usage.Detail, string, bool, bool, error) {
+func (e *KiroExecutor) parseEventStream(body io.Reader, model string) (kiroNonStreamResult, error) {
 	var content strings.Builder
+	var reasoning strings.Builder
+	var reasoningSignature string
+	var hasNativeReasoning bool
 	var toolUses []kiroclaude.KiroToolUse
 	var usageInfo usage.Detail
 	var stopReason string // Extracted from upstream response
@@ -2401,7 +2438,17 @@ func (e *KiroExecutor) parseEventStream(body io.Reader, model string) (string, [
 		msg, eventErr := e.readEventStreamMessage(reader)
 		if eventErr != nil {
 			log.Errorf("kiro: parseEventStream error: %v", eventErr)
-			return content.String(), toolUses, usageInfo, stopReason, false, false, eventErr
+			return kiroNonStreamResult{
+				Content:    content.String(),
+				ToolUses:   toolUses,
+				Usage:      usageInfo,
+				StopReason: stopReason,
+				Reasoning: kiroclaude.NativeReasoning{
+					Text:      reasoning.String(),
+					Signature: reasoningSignature,
+					Present:   hasNativeReasoning,
+				},
+			}, eventErr
 		}
 		if msg == nil {
 			// Normal end of stream (EOF)
@@ -2429,7 +2476,7 @@ func (e *KiroExecutor) parseEventStream(body io.Reader, model string) (string, [
 				errMsg = msg
 			}
 			log.Errorf("kiro: received AWS error in event stream: type=%s, message=%s", errType, errMsg)
-			return "", nil, usageInfo, stopReason, false, false, fmt.Errorf("kiro API error: %s - %s", errType, errMsg)
+			return kiroNonStreamResult{Usage: usageInfo, StopReason: stopReason}, fmt.Errorf("kiro API error: %s - %s", errType, errMsg)
 		}
 		if errType, hasErrType := event["type"].(string); hasErrType && (errType == "error" || errType == "exception") {
 			// Generic error event
@@ -2442,7 +2489,7 @@ func (e *KiroExecutor) parseEventStream(body io.Reader, model string) (string, [
 				}
 			}
 			log.Errorf("kiro: received error event in stream: type=%s, message=%s", errType, errMsg)
-			return "", nil, usageInfo, stopReason, false, false, fmt.Errorf("kiro API error: %s", errMsg)
+			return kiroNonStreamResult{Usage: usageInfo, StopReason: stopReason}, fmt.Errorf("kiro API error: %s", errMsg)
 		}
 
 		// Extract stop_reason from various event formats
@@ -2527,6 +2574,19 @@ func (e *KiroExecutor) parseEventStream(body io.Reader, model string) (string, [
 						toolUses = append(toolUses, toolUse)
 					}
 				}
+			}
+
+		case "reasoningContentEvent":
+			// The Claude models on the modern endpoint emit their reasoning here rather
+			// than as <thinking> tags in the text. Until this case existed the event fell
+			// through to default and was logged as unknown, so every non-streaming
+			// response arrived without the thinking block its streaming twin had.
+			text, sig := parseKiroReasoningEvent(event)
+			hasNativeReasoning = true
+			reasoning.WriteString(text)
+			if sig != "" {
+				// Kiro attaches the signature to the closing event, so the last one wins.
+				reasoningSignature = sig
 			}
 
 		case "toolUseEvent":
@@ -2767,7 +2827,7 @@ func (e *KiroExecutor) parseEventStream(body io.Reader, model string) (string, [
 
 			// For other errors, return the error
 			if errMsg != "" {
-				return "", nil, usageInfo, stopReason, false, false, fmt.Errorf("kiro API error (%s): %s", errType, errMsg)
+				return kiroNonStreamResult{Usage: usageInfo, StopReason: stopReason}, fmt.Errorf("kiro API error (%s): %s", errType, errMsg)
 			}
 
 		default:
@@ -2899,7 +2959,19 @@ func (e *KiroExecutor) parseEventStream(body io.Reader, model string) (string, [
 		usageInfo, estimatedCR, estimatedCW = estimateKiroCacheUsage(model, usageInfo, upstreamCreditUsage, hasUncachedInputTokens)
 	}
 
-	return cleanedContent, toolUses, usageInfo, stopReason, estimatedCR, estimatedCW, nil
+	return kiroNonStreamResult{
+		Content:    cleanedContent,
+		ToolUses:   toolUses,
+		Usage:      usageInfo,
+		StopReason: stopReason,
+		Reasoning: kiroclaude.NativeReasoning{
+			Text:      reasoning.String(),
+			Signature: reasoningSignature,
+			Present:   hasNativeReasoning,
+		},
+		EstimatedCacheRead:  estimatedCR,
+		EstimatedCacheWrite: estimatedCW,
+	}, nil
 }
 
 // readEventStreamMessage reads and validates a single AWS Event Stream message.
@@ -3828,33 +3900,23 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 			// Handle official reasoningContentEvent from Kiro API
 			// This replaces tag-based thinking detection with the proper event type
 			// Official format: { text: string, signature?: string, redactedContent?: base64 }
-			var thinkingText string
-			var signature string
-
-			if re, ok := event["reasoningContentEvent"].(map[string]interface{}); ok {
-				if text, ok := re["text"].(string); ok {
-					thinkingText = text
-				}
-				if sig, ok := re["signature"].(string); ok {
-					signature = sig
-					if len(sig) > 20 {
-						log.Debugf("kiro: reasoningContentEvent has signature: %s...", sig[:20])
-					} else {
-						log.Debugf("kiro: reasoningContentEvent has signature: %s", sig)
-					}
-				}
-			} else {
-				// Try direct fields
-				if text, ok := event["text"].(string); ok {
-					thinkingText = text
-				}
-				if sig, ok := event["signature"].(string); ok {
-					signature = sig
+			// Shared with the buffered reader in parseEventStream so the two readers
+			// cannot disagree about which shapes of the event they accept.
+			thinkingText, signature := parseKiroReasoningEvent(event)
+			if signature != "" {
+				if len(signature) > 20 {
+					log.Debugf("kiro: reasoningContentEvent has signature: %s...", signature[:20])
+				} else {
+					log.Debugf("kiro: reasoningContentEvent has signature: %s", signature)
 				}
 			}
 
+			// The event's arrival is what proves the backend reasons natively, so an
+			// empty one still disables tag parsing -- the line parseEventStream draws
+			// with NativeReasoning.Present.
+			hasOfficialReasoningEvent = true
+
 			if thinkingText != "" {
-				hasOfficialReasoningEvent = true
 				// Close text block if open before starting thinking block
 				if isTextBlockOpen && contentBlockIndex >= 0 {
 					blockStop := kiroclaude.BuildClaudeContentBlockStopEvent(contentBlockIndex)
@@ -3891,7 +3953,6 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 
 			// Note: We don't close the thinking block here - it will be closed when we see
 			// the next assistantResponseEvent or at the end of the stream
-			_ = signature // Signature can be used for verification if needed
 
 		case "toolUseEvent":
 			// Handle dedicated tool use events with input buffering
@@ -4155,15 +4216,18 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 
 	// Streaming token calculation - calculate output tokens from accumulated content
 	// Only use local estimation if server didn't provide usage (server-side usage takes priority)
-	if totalUsage.OutputTokens == 0 && accumulatedContent.Len() > 0 {
+	// Reasoning is billed as output as well, so it is counted alongside the visible
+	// text, the same way the buffered path estimates it.
+	if totalUsage.OutputTokens == 0 && accumulatedThinkingContent.Len()+accumulatedContent.Len() > 0 {
+		billed := accumulatedThinkingContent.String() + accumulatedContent.String()
 		// Try to use tiktoken for accurate counting
 		if enc, err := getTokenizer(model); err == nil {
-			if tokenCount, countErr := enc.Count(accumulatedContent.String()); countErr == nil {
+			if tokenCount, countErr := enc.Count(billed); countErr == nil {
 				totalUsage.OutputTokens = int64(tokenCount)
 				log.Debugf("kiro: streamToChannel calculated output tokens using tiktoken: %d", totalUsage.OutputTokens)
 			} else {
 				// Fallback on count error: estimate from character count
-				totalUsage.OutputTokens = int64(accumulatedContent.Len() / 4)
+				totalUsage.OutputTokens = int64(len(billed) / 4)
 				if totalUsage.OutputTokens == 0 {
 					totalUsage.OutputTokens = 1
 				}
@@ -4171,11 +4235,11 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 			}
 		} else {
 			// Fallback: estimate from character count (roughly 4 chars per token)
-			totalUsage.OutputTokens = int64(accumulatedContent.Len() / 4)
+			totalUsage.OutputTokens = int64(len(billed) / 4)
 			if totalUsage.OutputTokens == 0 {
 				totalUsage.OutputTokens = 1
 			}
-			log.Debugf("kiro: streamToChannel estimated output tokens from chars: %d (content len: %d)", totalUsage.OutputTokens, accumulatedContent.Len())
+			log.Debugf("kiro: streamToChannel estimated output tokens from chars: %d (content len: %d)", totalUsage.OutputTokens, len(billed))
 		}
 	} else if totalUsage.OutputTokens == 0 && outputLen > 0 {
 		// Legacy fallback using outputLen
