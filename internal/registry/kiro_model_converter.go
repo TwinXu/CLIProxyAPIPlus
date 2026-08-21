@@ -3,29 +3,6 @@
 // and merging with static metadata for thinking support and other capabilities.
 package registry
 
-import (
-	"strings"
-	"time"
-)
-
-// KiroAPIModel represents a model from Kiro API response.
-// This is a local copy to avoid import cycles with the kiro package.
-// The structure mirrors kiro.KiroModel for easy data conversion.
-type KiroAPIModel struct {
-	// ModelID is the unique identifier for the model (e.g., "claude-sonnet-4.5")
-	ModelID string
-	// ModelName is the human-readable name
-	ModelName string
-	// Description is the model description
-	Description string
-	// RateMultiplier is the credit multiplier for this model
-	RateMultiplier float64
-	// RateUnit is the unit for rate calculation (e.g., "credit")
-	RateUnit string
-	// MaxInputTokens is the maximum input token limit
-	MaxInputTokens int
-}
-
 // DefaultKiroThinkingSupport defines the default thinking configuration for Kiro models.
 // All Kiro models support thinking with the following budget range.
 var DefaultKiroThinkingSupport = &ThinkingSupport{
@@ -35,120 +12,92 @@ var DefaultKiroThinkingSupport = &ThinkingSupport{
 	DynamicAllowed: true,  // Allow dynamic thinking budget (-1)
 }
 
+// Capability numbers for the Claude 4.6-and-newer generation on Kiro, as
+// reported by ListAvailableModels on the Kiro backend. Read them yourself with:
+//
+//	go run ./cmd/kiroprobe -token <auth file> -model claude
+//
+// Recorded 2026-08-20. The Default* values above describe the Claude 4.5-era
+// backend and understate this generation on every axis, which is why these exist
+// separately rather than as new defaults. Re-probe when a new model lands: the
+// backend is the only authority for these, and a guess here silently misreports
+// every client's context and output budget.
+const (
+	// KiroModernContextLength is the context window Claude 4.6+ reports on Kiro.
+	KiroModernContextLength = 1000000
+	// KiroModernMaxOutputLarge is the output ceiling for the Opus 4.7/4.8/5 tier.
+	KiroModernMaxOutputLarge = 128000
+	// KiroModernMaxOutputStandard is the output ceiling for Sonnet and Opus 4.6.
+	KiroModernMaxOutputStandard = 64000
+)
+
+// Effort levels the backend accepts, from each model's
+// additionalModelRequestFieldsSchema. Claude 4.7 and newer added "xhigh"
+// between "high" and "max"; 4.6 has no such level and rejects it.
+var (
+	kiroEffortLevelsWithXHigh = []string{"low", "medium", "high", "xhigh", "max"}
+	kiroEffortLevels46        = []string{"low", "medium", "high", "max"}
+)
+
+// KiroEffortThinking builds a ThinkingSupport for a Kiro model whose strength is
+// a discrete effort level rather than a token budget. It copies the level slice
+// so callers cannot alias the package-level defaults above, and deliberately
+// leaves Min/Max at zero: the backend accepts no budget, and a non-zero range
+// here would make detectModelCapability read the model as budget-capable.
+func KiroEffortThinking(levels []string) *ThinkingSupport {
+	return &ThinkingSupport{
+		ZeroAllowed:    true,
+		DynamicAllowed: true,
+		Levels:         append([]string(nil), levels...),
+	}
+}
+
+// KiroThinkingWithXHigh returns the effort support shared by Claude 4.7, 4.8 and 5.
+func KiroThinkingWithXHigh() *ThinkingSupport { return KiroEffortThinking(kiroEffortLevelsWithXHigh) }
+
+// KiroThinking46 returns the effort support for the Claude 4.6 pair.
+func KiroThinking46() *ThinkingSupport { return KiroEffortThinking(kiroEffortLevels46) }
+
+// KiroThinkingForModel decides the ThinkingSupport a dynamically discovered Kiro
+// model should carry, given the effort levels the backend declared for it (empty
+// if it declared none).
+//
+// The whole point is that the dynamic path and the static table cannot disagree.
+// They are two descriptions of the same models, and only one of them wins per
+// model at runtime -- MergeWithStaticMetadata restores static metadata for
+// opus-4-8 alone, so for everything else whatever this returns is what the
+// registry believes. A disagreement is not cosmetic: it decides whether
+// /v1/models advertises thinking, and whether ApplyThinking normalises a client's
+// config or strips it.
+//
+// So the order is: the backend's own effort enum first, then whatever the static
+// table says for this exact model (including nothing, which is the honest answer
+// for the gpt-5-6 entries), and the Claude 4.5-era default only for a model no
+// static entry describes. TestKiroDynamicThinkingMatchesStaticTable pins it.
+func KiroThinkingForModel(modelID string, effortLevels []string) *ThinkingSupport {
+	if len(effortLevels) > 0 {
+		return KiroEffortThinking(effortLevels)
+	}
+	if static := LookupStaticModelInfo(modelID); static != nil {
+		// LookupStaticModelInfo already returns a clone, so static.Thinking is ours
+		// to hand back directly. Nil is a real answer here, not a missing one: the
+		// gpt-5-6 entries declare no thinking, and inventing some for them is the
+		// bug this function exists to prevent.
+		return static.Thinking
+	}
+	// A model neither the backend nor the catalogue describes. Nil says exactly
+	// that, and applyKiroThinking's guard turns it into "leave the client's config
+	// alone". The alternative -- asserting the Claude 4.5-era 1024-32000 budget --
+	// would be a guess about a model we have never seen, and would make us rewrite
+	// requests into a budget shape for a backend that may well take effort levels.
+	return nil
+}
+
 // DefaultKiroContextLength is the default context window size for Kiro models.
 const DefaultKiroContextLength = 200000
 
 // DefaultKiroMaxCompletionTokens is the default max completion tokens for Kiro models.
 const DefaultKiroMaxCompletionTokens = 64000
-
-// ConvertKiroAPIModels converts Kiro API models to internal ModelInfo format.
-// It performs the following transformations:
-//   - Normalizes model ID (e.g., claude-sonnet-4.5 → kiro-claude-sonnet-4-5)
-//   - Adds default thinking support metadata
-//   - Sets default context length and max completion tokens if not provided
-//
-// Parameters:
-//   - kiroModels: List of models from Kiro API response
-//
-// Returns:
-//   - []*ModelInfo: Converted model information list
-func ConvertKiroAPIModels(kiroModels []*KiroAPIModel) []*ModelInfo {
-	if len(kiroModels) == 0 {
-		return nil
-	}
-
-	now := time.Now().Unix()
-	result := make([]*ModelInfo, 0, len(kiroModels))
-
-	for _, km := range kiroModels {
-		// Skip nil models
-		if km == nil {
-			continue
-		}
-
-		// Skip models without valid ID
-		if km.ModelID == "" {
-			continue
-		}
-
-		// Normalize the model ID to kiro-* format
-		normalizedID := normalizeKiroModelID(km.ModelID)
-
-		// Create ModelInfo with converted data
-		info := &ModelInfo{
-			ID:          normalizedID,
-			Object:      "model",
-			Created:     now,
-			OwnedBy:     "aws",
-			Type:        "kiro",
-			DisplayName: generateKiroDisplayName(km.ModelName, normalizedID),
-			Description: km.Description,
-			// Use MaxInputTokens from API if available, otherwise use default
-			ContextLength:       getContextLength(km.MaxInputTokens),
-			MaxCompletionTokens: DefaultKiroMaxCompletionTokens,
-			// All Kiro models support thinking
-			Thinking: cloneThinkingSupport(DefaultKiroThinkingSupport),
-		}
-
-		result = append(result, info)
-	}
-
-	return result
-}
-
-// GenerateAgenticVariants creates -agentic variants for each model.
-// Agentic variants are optimized for coding agents with chunked writes.
-//
-// Parameters:
-//   - models: Base models to generate variants for
-//
-// Returns:
-//   - []*ModelInfo: Combined list of base models and their agentic variants
-func GenerateAgenticVariants(models []*ModelInfo) []*ModelInfo {
-	if len(models) == 0 {
-		return nil
-	}
-
-	// Pre-allocate result with capacity for both base models and variants
-	result := make([]*ModelInfo, 0, len(models)*2)
-
-	for _, model := range models {
-		if model == nil {
-			continue
-		}
-
-		// Add the base model first
-		result = append(result, model)
-
-		// Skip if model already has -agentic suffix
-		if strings.HasSuffix(model.ID, "-agentic") {
-			continue
-		}
-
-		// Skip special models that shouldn't have agentic variants
-		if model.ID == "kiro-auto" {
-			continue
-		}
-
-		// Create agentic variant
-		agenticModel := &ModelInfo{
-			ID:                  model.ID + "-agentic",
-			Object:              model.Object,
-			Created:             model.Created,
-			OwnedBy:             model.OwnedBy,
-			Type:                model.Type,
-			DisplayName:         model.DisplayName + " (Agentic)",
-			Description:         generateAgenticDescription(model.Description),
-			ContextLength:       model.ContextLength,
-			MaxCompletionTokens: model.MaxCompletionTokens,
-			Thinking:            cloneThinkingSupport(model.Thinking),
-		}
-
-		result = append(result, agenticModel)
-	}
-
-	return result
-}
 
 // MergeWithStaticMetadata merges dynamic models with static metadata.
 // Static metadata takes priority for any overlapping fields.
@@ -212,71 +161,6 @@ func MergeWithStaticMetadata(dynamicModels, staticModels []*ModelInfo) []*ModelI
 	}
 
 	return result
-}
-
-// normalizeKiroModelID converts Kiro API model IDs to internal format.
-// Transformation rules:
-//   - Adds "kiro-" prefix if not present
-//   - Replaces dots with hyphens (e.g., 4.5 → 4-5)
-//   - Handles special cases like "auto" → "kiro-auto"
-//
-// Examples:
-//   - "claude-sonnet-4.5" → "kiro-claude-sonnet-4-5"
-//   - "claude-opus-4.5" → "kiro-claude-opus-4-5"
-//   - "auto" → "kiro-auto"
-//   - "kiro-claude-sonnet-4-5" → "kiro-claude-sonnet-4-5" (unchanged)
-func normalizeKiroModelID(modelID string) string {
-	if modelID == "" {
-		return ""
-	}
-
-	// Trim whitespace
-	modelID = strings.TrimSpace(modelID)
-
-	// Replace dots with hyphens (e.g., 4.5 → 4-5)
-	normalized := strings.ReplaceAll(modelID, ".", "-")
-
-	// Add kiro- prefix if not present
-	if !strings.HasPrefix(normalized, "kiro-") {
-		normalized = "kiro-" + normalized
-	}
-
-	return normalized
-}
-
-// generateKiroDisplayName creates a human-readable display name.
-// Uses the API-provided model name if available, otherwise generates from ID.
-func generateKiroDisplayName(modelName, normalizedID string) string {
-	if modelName != "" {
-		return "Kiro " + modelName
-	}
-
-	// Generate from normalized ID by removing kiro- prefix and formatting
-	displayID := strings.TrimPrefix(normalizedID, "kiro-")
-	// Capitalize first letter of each word
-	words := strings.Split(displayID, "-")
-	for i, word := range words {
-		if len(word) > 0 {
-			words[i] = strings.ToUpper(word[:1]) + word[1:]
-		}
-	}
-	return "Kiro " + strings.Join(words, " ")
-}
-
-// generateAgenticDescription creates description for agentic variants.
-func generateAgenticDescription(baseDescription string) string {
-	if baseDescription == "" {
-		return "Optimized for coding agents with chunked writes"
-	}
-	return baseDescription + " (Agentic mode: chunked writes)"
-}
-
-// getContextLength returns the context length, using default if not provided.
-func getContextLength(maxInputTokens int) int {
-	if maxInputTokens > 0 {
-		return maxInputTokens
-	}
-	return DefaultKiroContextLength
 }
 
 // cloneThinkingSupport creates a deep copy of ThinkingSupport.

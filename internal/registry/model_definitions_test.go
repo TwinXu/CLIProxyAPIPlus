@@ -1,6 +1,9 @@
 package registry
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestGitHubCopilotGeminiModelsAreChatOnly(t *testing.T) {
 	models := GetGitHubCopilotModels()
@@ -106,6 +109,89 @@ func findModelInfo(models []*ModelInfo, id string) *ModelInfo {
 		}
 	}
 	return nil
+}
+
+// Every Claude entry in the Kiro table needs an -agentic twin. The static table is
+// the entire catalogue whenever the dynamic fetch fails, so a missing entry means
+// a model that executes (canonicalKiroModelName strips -agentic before routing)
+// but is never advertised, and whose capabilities nothing describes.
+//
+// The scope is kiro-claude-* because that is where the table is currently
+// complete. It is not complete elsewhere: the kiro-gpt-5-6-* entries have no
+// -agentic twins, and minimax-m2-5 and glm-5 route with no entry at all.
+func TestKiroClaudeModelsAllHaveAgenticVariants(t *testing.T) {
+	models := GetKiroModels()
+	for _, model := range models {
+		if model == nil || !strings.HasPrefix(model.ID, "kiro-claude-") {
+			continue
+		}
+		if strings.HasSuffix(model.ID, "-agentic") || strings.Contains(model.ID, "-auto") {
+			continue
+		}
+		if findModelInfo(models, model.ID+"-agentic") == nil {
+			t.Errorf("%s has no -agentic variant", model.ID)
+		}
+	}
+}
+
+// kiro-claude-opus-4-7 was added with the same 1M/128K/five-level shape as 4.8 but
+// no coverage; a typo in those numbers, or the entry going missing, shipped silently.
+func TestKiroStaticModelsIncludeOpus47(t *testing.T) {
+	for _, tc := range []struct{ id, displayName string }{
+		{"kiro-claude-opus-4-7", "Kiro Claude Opus 4.7"},
+		{"kiro-claude-opus-4-7-agentic", "Kiro Claude Opus 4.7 (Agentic)"},
+	} {
+		model := findModelInfo(GetKiroModels(), tc.id)
+		if model == nil {
+			t.Fatalf("expected Kiro models to include %s", tc.id)
+		}
+		if model.DisplayName != tc.displayName {
+			t.Errorf("%s display name: got %q, want %q", tc.id, model.DisplayName, tc.displayName)
+		}
+		if model.ContextLength != KiroModernContextLength {
+			t.Errorf("%s context length: got %d, want %d", tc.id, model.ContextLength, KiroModernContextLength)
+		}
+		if model.MaxCompletionTokens != KiroModernMaxOutputLarge {
+			t.Errorf("%s max completion tokens: got %d, want %d", tc.id, model.MaxCompletionTokens, KiroModernMaxOutputLarge)
+		}
+		if model.Thinking == nil || len(model.Thinking.Levels) != 5 {
+			t.Fatalf("%s should declare the five-level effort set, got %+v", tc.id, model.Thinking)
+		}
+	}
+}
+
+// The Claude 5 pair uses effort levels, so their ThinkingSupport must carry Levels
+// and no budget: a non-zero Min/Max would make detectModelCapability read them as
+// budget-capable and send a budget the backend does not accept.
+func TestKiroClaude5ModelsDeclareEffortLevelsNotBudgets(t *testing.T) {
+	for _, id := range []string{
+		"kiro-claude-opus-5", "kiro-claude-sonnet-5",
+		"kiro-claude-opus-5-agentic", "kiro-claude-sonnet-5-agentic",
+	} {
+		model := findModelInfo(GetKiroModels(), id)
+		if model == nil {
+			t.Fatalf("expected Kiro models to include %s", id)
+		}
+		if model.Thinking == nil {
+			t.Fatalf("%s: missing thinking support", id)
+		}
+		if model.Thinking.Min != 0 || model.Thinking.Max != 0 {
+			t.Errorf("%s must not declare a token budget: %+v", id, model.Thinking)
+		}
+		if len(model.Thinking.Levels) == 0 {
+			t.Errorf("%s must declare effort levels", id)
+		}
+	}
+}
+
+// KiroEffortThinking hands out copies. Sharing the package-level level slices
+// would let one model's registration mutate every other model's levels.
+func TestKiroEffortThinkingDoesNotAliasSharedLevels(t *testing.T) {
+	first := KiroThinkingWithXHigh()
+	first.Levels[0] = "mutated"
+	if second := KiroThinkingWithXHigh(); second.Levels[0] != "low" {
+		t.Fatalf("level slice is shared between callers: got %v", second.Levels)
+	}
 }
 
 // assertKiroOpus48ModelInfo checks the Kiro entry against what ListAvailableModels
@@ -222,6 +308,82 @@ func assertGPT55ModelInfo(t *testing.T, source string, model *ModelInfo) {
 	for i, level := range want {
 		if model.Thinking.Levels[i] != level {
 			t.Fatalf("%s thinking level %d mismatch: got %q, want %q", source, i, model.Thinking.Levels[i], level)
+		}
+	}
+}
+
+// The dynamic converter and the static table are two descriptions of the same
+// models, and only one wins per model at runtime (MergeWithStaticMetadata
+// restores static metadata for opus-4-8 alone). A disagreement decides whether
+// /v1/models advertises thinking and whether ApplyThinking normalises a client's
+// config or strips it, so pin that they cannot drift.
+//
+// The gpt-5-6 entries are the ones that matter here: they are the only Kiro
+// models the static table gives no thinking support at all, so a blanket default
+// in the converter would invent support for exactly them.
+func TestKiroDynamicThinkingMatchesStaticTable(t *testing.T) {
+	for _, static := range GetKiroModels() {
+		if static == nil {
+			continue
+		}
+		t.Run(static.ID, func(t *testing.T) {
+			// No effort levels: the backend said nothing, so the static table decides.
+			got := KiroThinkingForModel(static.ID, nil)
+
+			if (got == nil) != (static.Thinking == nil) {
+				t.Fatalf("thinking presence differs: dynamic=%+v static=%+v", got, static.Thinking)
+			}
+			if got == nil {
+				return
+			}
+			if got.Min != static.Thinking.Min || got.Max != static.Thinking.Max ||
+				got.ZeroAllowed != static.Thinking.ZeroAllowed ||
+				got.DynamicAllowed != static.Thinking.DynamicAllowed ||
+				len(got.Levels) != len(static.Thinking.Levels) {
+				t.Fatalf("thinking differs: dynamic=%+v static=%+v", got, static.Thinking)
+			}
+			for i := range got.Levels {
+				if got.Levels[i] != static.Thinking.Levels[i] {
+					t.Fatalf("levels differ: dynamic=%v static=%v", got.Levels, static.Thinking.Levels)
+				}
+			}
+		})
+	}
+}
+
+// A model the static table does not describe still needs sensible metadata, and
+// the backend's own enum must win over both.
+func TestKiroThinkingForModelFallbacks(t *testing.T) {
+	// A model neither the backend nor the catalogue describes gets nil, not a
+	// fabricated budget: applyKiroThinking reads that as "leave the client's
+	// config alone", which is the only honest answer for a model we know nothing
+	// about.
+	if unknown := KiroThinkingForModel("kiro-brand-new-model", nil); unknown != nil {
+		t.Fatalf("an undescribed model must not be asserted thinking-capable, got %+v", unknown)
+	}
+
+	declared := KiroThinkingForModel("kiro-gpt-5-6-sol", []string{"low", "high"})
+	if declared == nil || len(declared.Levels) != 2 {
+		t.Fatalf("a backend-declared enum must win over the static table, got %+v", declared)
+	}
+
+	// Mutating a returned value must not be visible to the next caller. This holds
+	// because LookupStaticModelInfo already deep-copies and GetKiroModels rebuilds
+	// from literals, so it is a guard against either of those changing rather than
+	// against the current code.
+	first := KiroThinkingForModel("kiro-claude-sonnet-4-5", nil)
+	if first == nil {
+		t.Fatal("expected thinking support for kiro-claude-sonnet-4-5")
+	}
+	first.Max = 1
+	first.Levels = append(first.Levels, "injected")
+	second := KiroThinkingForModel("kiro-claude-sonnet-4-5", nil)
+	if second.Max == 1 {
+		t.Fatal("KiroThinkingForModel leaks Max mutations to later callers")
+	}
+	for _, level := range second.Levels {
+		if level == "injected" {
+			t.Fatal("KiroThinkingForModel leaks Levels mutations to later callers")
 		}
 	}
 }

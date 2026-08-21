@@ -1754,17 +1754,18 @@ func convertKiroAPIModels(apiModels []*kiroauth.KiroModel) []*ModelInfo {
 		}
 
 		// Thinking strength on Kiro is a discrete effort level, not a token budget:
-		// the backend's schema exposes output_config.effort with an explicit enum and
-		// no budget field anywhere. Take the levels it reports rather than asserting
-		// a range it never accepts. A model that declares no enum (Claude 4.5 and
-		// older) is telling us it has no adaptive thinking to configure.
-		if len(m.EffortLevels) > 0 {
-			info.Thinking = &registry.ThinkingSupport{
-				ZeroAllowed:    true,
-				DynamicAllowed: true,
-				Levels:         append([]string(nil), m.EffortLevels...),
-			}
-		}
+		// the backend's schema exposes output_config.effort with an explicit enum
+		// and no budget field anywhere, so take the levels it reports rather than
+		// asserting a range it never accepts.
+		//
+		// When it reports none, the answer has to come from the static table rather
+		// than from nil or from a blanket default. This converter is the live path
+		// for every model except opus-4-8, so whatever lands here is what the
+		// registry believes; getting it wrong either drops thinking support the
+		// static table declares (making ApplyThinking strip client config) or
+		// invents support the static table denies. registry.KiroThinkingForModel
+		// owns that decision, next to the table it has to agree with.
+		info.Thinking = registry.KiroThinkingForModel(modelID, m.EffortLevels)
 
 		models = append(models, info)
 	}

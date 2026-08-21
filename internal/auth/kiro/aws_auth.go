@@ -206,10 +206,17 @@ func (k *KiroAuth) GetUsageLimits(ctx context.Context, tokenData *KiroTokenData)
 // model (context window, output ceiling, thinking limits), the parsed struct
 // cannot answer it and the raw body can.
 func (k *KiroAuth) ListAvailableModelsRaw(ctx context.Context, tokenData *KiroTokenData) ([]byte, error) {
-	return k.makeRequest(ctx, pathListAvailableModels, tokenData, map[string]string{
+	return k.makeRequest(ctx, pathListAvailableModels, tokenData, listAvailableModelsParams(tokenData))
+}
+
+// listAvailableModelsParams builds the query for ListAvailableModels. Shared by
+// the parsed and raw calls on purpose: a probe is only worth anything if it
+// issues the request production issues, and two copies of this map would drift.
+func listAvailableModelsParams(tokenData *KiroTokenData) map[string]string {
+	return map[string]string{
 		"origin":     "AI_EDITOR",
 		"profileArn": tokenData.ProfileArn,
-	})
+	}
 }
 
 // ListAvailableModels retrieves available models from the CodeWhisperer API.
@@ -223,16 +230,20 @@ func (k *KiroAuth) ListAvailableModelsRaw(ctx context.Context, tokenData *KiroTo
 //   - []*KiroModel: The list of available models
 //   - error: An error if the request fails
 func (k *KiroAuth) ListAvailableModels(ctx context.Context, tokenData *KiroTokenData) ([]*KiroModel, error) {
-	queryParams := map[string]string{
-		"origin":     "AI_EDITOR",
-		"profileArn": tokenData.ProfileArn,
-	}
-
-	body, err := k.makeRequest(ctx, pathListAvailableModels, tokenData, queryParams)
+	body, err := k.makeRequest(ctx, pathListAvailableModels, tokenData, listAvailableModelsParams(tokenData))
 	if err != nil {
 		return nil, err
 	}
+	return ParseAvailableModels(body)
+}
 
+// ParseAvailableModels decodes a ListAvailableModels response body.
+//
+// Exported so a caller holding the raw body can parse those exact bytes rather
+// than issuing a second request and hoping the backend answered identically --
+// which is the whole job of cmd/kiroprobe, whose value depends on the parsed view
+// and the raw view describing one response.
+func ParseAvailableModels(body []byte) ([]*KiroModel, error) {
 	var result struct {
 		Models []struct {
 			ModelID        string  `json:"modelId"`
@@ -248,18 +259,15 @@ func (k *KiroAuth) ListAvailableModels(ctx context.Context, tokenData *KiroToken
 			// extra request fields this model accepts. For Claude 4.6 and newer it
 			// carries the output_config.effort enum, which is the backend's own
 			// statement of the reasoning levels it will honour.
-			AdditionalModelRequestFieldsSchema *struct {
-				Properties *struct {
-					OutputConfig *struct {
-						Properties *struct {
-							Effort *struct {
-								Enum    []string `json:"enum"`
-								Default string   `json:"default"`
-							} `json:"effort"`
-						} `json:"properties"`
-					} `json:"output_config"`
-				} `json:"properties"`
-			} `json:"additionalModelRequestFieldsSchema"`
+			//
+			// Held as RawMessage and parsed separately on purpose. Decoding it into
+			// fixed structs here would put the whole response at the mercy of this
+			// one field's shape: json.Unmarshal reports a type mismatch anywhere in
+			// the document as an error for the document, so a schema arriving as a
+			// JSON string, or an enum holding a non-string, would make us discard a
+			// perfectly good model list and fall back to the static catalogue. A
+			// surprise here must cost us the levels for one model, nothing more.
+			AdditionalModelRequestFieldsSchema json.RawMessage `json:"additionalModelRequestFieldsSchema"`
 		} `json:"models"`
 	}
 
@@ -274,17 +282,7 @@ func (k *KiroAuth) ListAvailableModels(ctx context.Context, tokenData *KiroToken
 			maxInputTokens = m.TokenLimits.MaxInputTokens
 			maxOutputTokens = m.TokenLimits.MaxOutputTokens
 		}
-		var effortLevels []string
-		defaultEffort := ""
-		if schema := m.AdditionalModelRequestFieldsSchema; schema != nil &&
-			schema.Properties != nil &&
-			schema.Properties.OutputConfig != nil &&
-			schema.Properties.OutputConfig.Properties != nil &&
-			schema.Properties.OutputConfig.Properties.Effort != nil {
-			effort := schema.Properties.OutputConfig.Properties.Effort
-			effortLevels = append(effortLevels, effort.Enum...)
-			defaultEffort = effort.Default
-		}
+		effortLevels, defaultEffort := parseEffortSchema(m.AdditionalModelRequestFieldsSchema, m.ModelID)
 		models = append(models, &KiroModel{
 			ModelID:         m.ModelID,
 			ModelName:       m.ModelName,
@@ -299,6 +297,74 @@ func (k *KiroAuth) ListAvailableModels(ctx context.Context, tokenData *KiroToken
 	}
 
 	return models, nil
+}
+
+// parseEffortSchema pulls the output_config.effort enum out of a model's
+// additionalModelRequestFieldsSchema.
+//
+// Everything here is deliberately permissive. The schema is the backend's data,
+// not ours, and the only thing riding on it is whether we can offer discrete
+// effort levels for one model; any shape we do not recognise degrades to "no
+// levels declared" rather than failing the caller. Two shapes are accepted
+// because AWS is not consistent about them: the schema as a JSON object, and the
+// schema as a JSON string that itself contains the object. Enum entries that are
+// not strings are skipped instead of poisoning the whole list.
+//
+// modelID is used only for logging.
+func parseEffortSchema(raw json.RawMessage, modelID string) (levels []string, defaultEffort string) {
+	if len(raw) == 0 {
+		return nil, ""
+	}
+
+	var doc any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		log.Debugf("kiro: model %s has an unparsable additionalModelRequestFieldsSchema, treating it as declaring no effort levels: %v", modelID, err)
+		return nil, ""
+	}
+	// The schema may arrive double-encoded, as a JSON string holding the object.
+	if nested, ok := doc.(string); ok {
+		if err := json.Unmarshal([]byte(nested), &doc); err != nil {
+			log.Debugf("kiro: model %s has a string additionalModelRequestFieldsSchema that is not itself JSON, treating it as declaring no effort levels", modelID)
+			return nil, ""
+		}
+	}
+
+	effort, ok := descend(doc, "properties", "output_config", "properties", "effort")
+	if !ok {
+		return nil, ""
+	}
+	effortMap, ok := effort.(map[string]any)
+	if !ok {
+		return nil, ""
+	}
+
+	if enum, isSlice := effortMap["enum"].([]any); isSlice {
+		for _, entry := range enum {
+			if level, isString := entry.(string); isString && strings.TrimSpace(level) != "" {
+				levels = append(levels, level)
+			}
+		}
+	}
+	if def, isString := effortMap["default"].(string); isString {
+		defaultEffort = def
+	}
+	return levels, defaultEffort
+}
+
+// descend walks a chain of object keys, stopping at the first level that is not
+// an object or does not carry the key.
+func descend(node any, keys ...string) (any, bool) {
+	for _, key := range keys {
+		obj, ok := node.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		node, ok = obj[key]
+		if !ok {
+			return nil, false
+		}
+	}
+	return node, true
 }
 
 // CreateTokenStorage creates a new KiroTokenStorage from token data.

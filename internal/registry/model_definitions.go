@@ -743,26 +743,26 @@ func GetKiroModels() []*ModelInfo {
 		{
 			ID:                  "kiro-claude-opus-5",
 			Object:              "model",
-			Created:             1786060800, // 2026-08-14
+			Created:             1786060800, // 2026-08-07
 			OwnedBy:             "aws",
 			Type:                "kiro",
 			DisplayName:         "Kiro Claude Opus 5",
 			Description:         "Claude Opus 5 via Kiro (2.2x credit)",
-			ContextLength:       1000000,
-			MaxCompletionTokens: 128000,
-			Thinking:            &ThinkingSupport{ZeroAllowed: true, DynamicAllowed: true, Levels: []string{"low", "medium", "high", "xhigh", "max"}},
+			ContextLength:       KiroModernContextLength,
+			MaxCompletionTokens: KiroModernMaxOutputLarge,
+			Thinking:            KiroThinkingWithXHigh(),
 		},
 		{
 			ID:                  "kiro-claude-sonnet-5",
 			Object:              "model",
-			Created:             1786060800, // 2026-08-14
+			Created:             1786060800, // 2026-08-07
 			OwnedBy:             "aws",
 			Type:                "kiro",
 			DisplayName:         "Kiro Claude Sonnet 5",
 			Description:         "Claude Sonnet 5 via Kiro (1.3x credit)",
-			ContextLength:       1000000,
-			MaxCompletionTokens: 64000,
-			Thinking:            &ThinkingSupport{ZeroAllowed: true, DynamicAllowed: true, Levels: []string{"low", "medium", "high", "xhigh", "max"}},
+			ContextLength:       KiroModernContextLength,
+			MaxCompletionTokens: KiroModernMaxOutputStandard,
+			Thinking:            KiroThinkingWithXHigh(),
 		},
 		{
 			ID:                  "kiro-claude-opus-4-8",
@@ -772,21 +772,21 @@ func GetKiroModels() []*ModelInfo {
 			Type:                "kiro",
 			DisplayName:         "Kiro Claude Opus 4.8",
 			Description:         "Claude Opus 4.8 via Kiro (2.2x credit)",
-			ContextLength:       1000000,
-			MaxCompletionTokens: 128000,
-			Thinking:            &ThinkingSupport{ZeroAllowed: true, DynamicAllowed: true, Levels: []string{"low", "medium", "high", "xhigh", "max"}},
+			ContextLength:       KiroModernContextLength,
+			MaxCompletionTokens: KiroModernMaxOutputLarge,
+			Thinking:            KiroThinkingWithXHigh(),
 		},
 		{
 			ID:                  "kiro-claude-opus-4-7",
 			Object:              "model",
-			Created:             1783382400, // 2026-07-14
+			Created:             1783382400, // 2026-07-07
 			OwnedBy:             "aws",
 			Type:                "kiro",
 			DisplayName:         "Kiro Claude Opus 4.7",
 			Description:         "Claude Opus 4.7 via Kiro (2.2x credit)",
-			ContextLength:       1000000,
-			MaxCompletionTokens: 128000,
-			Thinking:            &ThinkingSupport{ZeroAllowed: true, DynamicAllowed: true, Levels: []string{"low", "medium", "high", "xhigh", "max"}},
+			ContextLength:       KiroModernContextLength,
+			MaxCompletionTokens: KiroModernMaxOutputLarge,
+			Thinking:            KiroThinkingWithXHigh(),
 		},
 		{
 			ID:                  "kiro-claude-opus-4-6",
@@ -796,9 +796,9 @@ func GetKiroModels() []*ModelInfo {
 			Type:                "kiro",
 			DisplayName:         "Kiro Claude Opus 4.6",
 			Description:         "Claude Opus 4.6 via Kiro (2.2x credit)",
-			ContextLength:       1000000,
-			MaxCompletionTokens: 64000,
-			Thinking:            &ThinkingSupport{ZeroAllowed: true, DynamicAllowed: true, Levels: []string{"low", "medium", "high", "max"}},
+			ContextLength:       KiroModernContextLength,
+			MaxCompletionTokens: KiroModernMaxOutputStandard,
+			Thinking:            KiroThinking46(),
 		},
 		{
 			ID:                  "kiro-claude-sonnet-4-6",
@@ -808,9 +808,9 @@ func GetKiroModels() []*ModelInfo {
 			Type:                "kiro",
 			DisplayName:         "Kiro Claude Sonnet 4.6",
 			Description:         "Claude Sonnet 4.6 via Kiro (1.3x credit)",
-			ContextLength:       1000000,
-			MaxCompletionTokens: 64000,
-			Thinking:            &ThinkingSupport{ZeroAllowed: true, DynamicAllowed: true, Levels: []string{"low", "medium", "high", "max"}},
+			ContextLength:       KiroModernContextLength,
+			MaxCompletionTokens: KiroModernMaxOutputStandard,
+			Thinking:            KiroThinking46(),
 		},
 		{
 			ID:                  "kiro-claude-opus-4-5",
@@ -905,7 +905,7 @@ func GetKiroModels() []*ModelInfo {
 		{
 			ID:                  "kiro-gpt-5-6-sol",
 			Object:              "model",
-			Created:             1786060800, // 2026-08-14
+			Created:             1786060800, // 2026-08-07
 			OwnedBy:             "aws",
 			Type:                "kiro",
 			DisplayName:         "Kiro GPT 5.6 Sol",
@@ -916,7 +916,7 @@ func GetKiroModels() []*ModelInfo {
 		{
 			ID:                  "kiro-gpt-5-6-terra",
 			Object:              "model",
-			Created:             1786060800, // 2026-08-14
+			Created:             1786060800, // 2026-08-07
 			OwnedBy:             "aws",
 			Type:                "kiro",
 			DisplayName:         "Kiro GPT 5.6 Terra",
@@ -927,7 +927,7 @@ func GetKiroModels() []*ModelInfo {
 		{
 			ID:                  "kiro-gpt-5-6-luna",
 			Object:              "model",
-			Created:             1786060800, // 2026-08-14
+			Created:             1786060800, // 2026-08-07
 			OwnedBy:             "aws",
 			Type:                "kiro",
 			DisplayName:         "Kiro GPT 5.6 Luna",
@@ -936,6 +936,37 @@ func GetKiroModels() []*ModelInfo {
 			MaxCompletionTokens: DefaultKiroMaxCompletionTokens,
 		},
 		// --- Agentic Variants (Optimized for coding agents with chunked writes) ---
+		//
+		// Every base Claude entry above needs one of these. The dynamic path builds
+		// agentic variants itself (generateKiroAgenticVariants), but this table is
+		// the entire catalogue when the model-list fetch fails, and a missing entry
+		// means a model that still executes -- canonicalKiroModelName strips
+		// -agentic before routing -- while being advertised nowhere and described
+		// by nothing, so applyKiroThinking cannot resolve its capabilities either.
+		{
+			ID:                  "kiro-claude-opus-5-agentic",
+			Object:              "model",
+			Created:             1786060800, // 2026-08-07
+			OwnedBy:             "aws",
+			Type:                "kiro",
+			DisplayName:         "Kiro Claude Opus 5 (Agentic)",
+			Description:         "Claude Opus 5 optimized for coding agents (chunked writes)",
+			ContextLength:       KiroModernContextLength,
+			MaxCompletionTokens: KiroModernMaxOutputLarge,
+			Thinking:            KiroThinkingWithXHigh(),
+		},
+		{
+			ID:                  "kiro-claude-sonnet-5-agentic",
+			Object:              "model",
+			Created:             1786060800, // 2026-08-07
+			OwnedBy:             "aws",
+			Type:                "kiro",
+			DisplayName:         "Kiro Claude Sonnet 5 (Agentic)",
+			Description:         "Claude Sonnet 5 optimized for coding agents (chunked writes)",
+			ContextLength:       KiroModernContextLength,
+			MaxCompletionTokens: KiroModernMaxOutputStandard,
+			Thinking:            KiroThinkingWithXHigh(),
+		},
 		{
 			ID:                  "kiro-claude-opus-4-8-agentic",
 			Object:              "model",
@@ -944,9 +975,21 @@ func GetKiroModels() []*ModelInfo {
 			Type:                "kiro",
 			DisplayName:         "Kiro Claude Opus 4.8 (Agentic)",
 			Description:         "Claude Opus 4.8 optimized for coding agents (chunked writes)",
-			ContextLength:       1000000,
-			MaxCompletionTokens: 128000,
-			Thinking:            &ThinkingSupport{ZeroAllowed: true, DynamicAllowed: true, Levels: []string{"low", "medium", "high", "xhigh", "max"}},
+			ContextLength:       KiroModernContextLength,
+			MaxCompletionTokens: KiroModernMaxOutputLarge,
+			Thinking:            KiroThinkingWithXHigh(),
+		},
+		{
+			ID:                  "kiro-claude-opus-4-7-agentic",
+			Object:              "model",
+			Created:             1783382400, // 2026-07-07
+			OwnedBy:             "aws",
+			Type:                "kiro",
+			DisplayName:         "Kiro Claude Opus 4.7 (Agentic)",
+			Description:         "Claude Opus 4.7 optimized for coding agents (chunked writes)",
+			ContextLength:       KiroModernContextLength,
+			MaxCompletionTokens: KiroModernMaxOutputLarge,
+			Thinking:            KiroThinkingWithXHigh(),
 		},
 		{
 			ID:                  "kiro-claude-opus-4-6-agentic",
@@ -956,9 +999,9 @@ func GetKiroModels() []*ModelInfo {
 			Type:                "kiro",
 			DisplayName:         "Kiro Claude Opus 4.6 (Agentic)",
 			Description:         "Claude Opus 4.6 optimized for coding agents (chunked writes)",
-			ContextLength:       1000000,
-			MaxCompletionTokens: 64000,
-			Thinking:            &ThinkingSupport{ZeroAllowed: true, DynamicAllowed: true, Levels: []string{"low", "medium", "high", "max"}},
+			ContextLength:       KiroModernContextLength,
+			MaxCompletionTokens: KiroModernMaxOutputStandard,
+			Thinking:            KiroThinking46(),
 		},
 		{
 			ID:                  "kiro-claude-sonnet-4-6-agentic",
@@ -968,9 +1011,9 @@ func GetKiroModels() []*ModelInfo {
 			Type:                "kiro",
 			DisplayName:         "Kiro Claude Sonnet 4.6 (Agentic)",
 			Description:         "Claude Sonnet 4.6 optimized for coding agents (chunked writes)",
-			ContextLength:       1000000,
-			MaxCompletionTokens: 64000,
-			Thinking:            &ThinkingSupport{ZeroAllowed: true, DynamicAllowed: true, Levels: []string{"low", "medium", "high", "max"}},
+			ContextLength:       KiroModernContextLength,
+			MaxCompletionTokens: KiroModernMaxOutputStandard,
+			Thinking:            KiroThinking46(),
 		},
 		{
 			ID:                  "kiro-claude-opus-4-5-agentic",
