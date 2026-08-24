@@ -778,13 +778,49 @@ func convertClaudeToolsToKiro(tools gjson.Result) []KiroToolWrapper {
 }
 
 // processMessages processes Claude messages and builds Kiro history
+// normalizeConversationRoles rewrites roles Kiro has no slot for into "user".
+//
+// Kiro's conversation shape only knows userInputMessage and
+// assistantResponseMessage; the system prompt is folded into the current user
+// turn, and processMessages below ignores anything that is neither "user" nor
+// "assistant". The Claude Agent SDK appends a trailing role:"system" reminder on
+// the first turn of a fresh session, which meant that turn produced no
+// currentUserMsg at all -- so BuildKiroPayload took its bare-currentMessage
+// fallback and never built userInputMessageContext, the only place tools are
+// carried. The request reached Kiro with zero toolSpecification entries and the
+// model, having no tools, narrated its tool calls as prose.
+//
+// Rewriting to "user" before the merge lets MergeAdjacentMessages fold the
+// reminder into the user turn it belongs to, which both restores the tools and
+// keeps the reminder's text. "tool" is left alone: MergeAdjacentMessages
+// deliberately keeps those separate because each carries its own tool_call_id.
+func normalizeConversationRoles(messages []gjson.Result) []gjson.Result {
+	normalized := make([]gjson.Result, 0, len(messages))
+	for _, msg := range messages {
+		role := msg.Get("role").String()
+		if role == "user" || role == "assistant" || role == "tool" {
+			normalized = append(normalized, msg)
+			continue
+		}
+		rewritten, err := sjson.Set(msg.Raw, "role", "user")
+		if err != nil {
+			log.Warnf("kiro: cannot rewrite message role %q to user: %v", role, err)
+			normalized = append(normalized, msg)
+			continue
+		}
+		log.Debugf("kiro: rewrote message role %q to user so its content and the request tools survive", role)
+		normalized = append(normalized, gjson.Parse(rewritten))
+	}
+	return normalized
+}
+
 func processMessages(messages gjson.Result, modelID, origin string) ([]KiroHistoryMessage, *KiroUserInputMessage, []KiroToolResult) {
 	var history []KiroHistoryMessage
 	var currentUserMsg *KiroUserInputMessage
 	var currentToolResults []KiroToolResult
 
 	// Merge adjacent messages with the same role
-	messagesArray := kirocommon.MergeAdjacentMessages(messages.Array())
+	messagesArray := kirocommon.MergeAdjacentMessages(normalizeConversationRoles(messages.Array()))
 
 	// FIX: Kiro API requires history to start with a user message.
 	// Some clients (e.g., OpenClaw) send conversations starting with an assistant message,
