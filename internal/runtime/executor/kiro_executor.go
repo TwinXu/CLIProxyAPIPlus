@@ -3668,7 +3668,14 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 				}
 
 				if hasOfficialReasoningEvent {
-					processText := strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(contentDelta, kirocommon.ThinkingStartTag, ""), kirocommon.ThinkingEndTag, ""))
+					processText := strings.ReplaceAll(strings.ReplaceAll(contentDelta, kirocommon.ThinkingStartTag, ""), kirocommon.ThinkingEndTag, "")
+					if !isTextBlockOpen {
+						// Trim only the whitespace prologue between the thinking block
+						// and the first word of the answer. Trimming every chunk instead
+						// deleted any space, newline or indentation that happened to land
+						// on an upstream chunk boundary ("let me run it" -> "letme run it").
+						processText = strings.TrimLeft(processText, " \t\r\n")
+					}
 					if processText != "" {
 						if !isTextBlockOpen {
 							// A native reasoningContentEvent stream leaves a thinking block open;
