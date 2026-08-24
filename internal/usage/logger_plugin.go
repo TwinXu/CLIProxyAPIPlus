@@ -17,6 +17,11 @@ import (
 
 var statisticsEnabled atomic.Bool
 
+const (
+	authIndexRequestWindowCount    = 20
+	authIndexRequestWindowDuration = 10 * time.Minute
+)
+
 func init() {
 	statisticsEnabled.Store(true)
 	coreusage.RegisterPlugin(NewLoggerPlugin())
@@ -76,14 +81,28 @@ type RequestStatistics struct {
 }
 
 type authIndexStats struct {
+	Success        int64
+	Failure        int64
+	RecentRequests map[int64]*authIndexRequestWindowCounts
+}
+
+type authIndexRequestWindowCounts struct {
 	Success int64
 	Failure int64
 }
 
+// AuthIndexRequestWindow contains per-auth request counts for one time window.
+type AuthIndexRequestWindow struct {
+	Time    time.Time
+	Success int64
+	Failed  int64
+}
+
 // AuthIndexCounts is the per-auth snapshot shape returned to handlers.
 type AuthIndexCounts struct {
-	Success int64
-	Failure int64
+	Success        int64
+	Failure        int64
+	RecentRequests []AuthIndexRequestWindow
 }
 
 // apiStats holds aggregated metrics for a single API key.
@@ -228,16 +247,7 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	s.tokensByHour[hourKey] += totalTokens
 
 	if authIdx := strings.TrimSpace(record.AuthIndex); authIdx != "" {
-		entry, ok := s.authIndex[authIdx]
-		if !ok {
-			entry = &authIndexStats{}
-			s.authIndex[authIdx] = entry
-		}
-		if success {
-			entry.Success++
-		} else {
-			entry.Failure++
-		}
+		s.updateAuthIndexStats(authIdx, timestamp, success)
 	}
 }
 
@@ -248,14 +258,69 @@ func (s *RequestStatistics) AuthIndexCountsSnapshot() map[string]AuthIndexCounts
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	currentWindow := time.Now().UTC().Truncate(authIndexRequestWindowDuration)
 	out := make(map[string]AuthIndexCounts, len(s.authIndex))
 	for k, v := range s.authIndex {
 		if v == nil {
 			continue
 		}
-		out[k] = AuthIndexCounts{Success: v.Success, Failure: v.Failure}
+		recentRequests := make([]AuthIndexRequestWindow, authIndexRequestWindowCount)
+		for i := range recentRequests {
+			windowStart := currentWindow.Add(time.Duration(i-(authIndexRequestWindowCount-1)) * authIndexRequestWindowDuration)
+			recentRequests[i].Time = windowStart
+			if counts := v.RecentRequests[windowStart.Unix()]; counts != nil {
+				recentRequests[i].Success = counts.Success
+				recentRequests[i].Failed = counts.Failure
+			}
+		}
+		out[k] = AuthIndexCounts{
+			Success:        v.Success,
+			Failure:        v.Failure,
+			RecentRequests: recentRequests,
+		}
 	}
 	return out
+}
+
+// updateAuthIndexStats updates one auth entry while RequestStatistics.mu is held.
+func (s *RequestStatistics) updateAuthIndexStats(authIndex string, timestamp time.Time, success bool) {
+	entry, ok := s.authIndex[authIndex]
+	if !ok || entry == nil {
+		entry = &authIndexStats{}
+		s.authIndex[authIndex] = entry
+	}
+	if success {
+		entry.Success++
+	} else {
+		entry.Failure++
+	}
+
+	currentWindow := time.Now().UTC().Truncate(authIndexRequestWindowDuration)
+	oldestWindow := currentWindow.Add(-(authIndexRequestWindowCount - 1) * authIndexRequestWindowDuration)
+	windowStart := timestamp.UTC().Truncate(authIndexRequestWindowDuration)
+	if windowStart.Before(oldestWindow) || windowStart.After(currentWindow) {
+		return
+	}
+	if entry.RecentRequests == nil {
+		entry.RecentRequests = make(map[int64]*authIndexRequestWindowCounts)
+	}
+	oldestUnix := oldestWindow.Unix()
+	currentUnix := currentWindow.Unix()
+	for bucket := range entry.RecentRequests {
+		if bucket < oldestUnix || bucket > currentUnix {
+			delete(entry.RecentRequests, bucket)
+		}
+	}
+	counts := entry.RecentRequests[windowStart.Unix()]
+	if counts == nil {
+		counts = &authIndexRequestWindowCounts{}
+		entry.RecentRequests[windowStart.Unix()] = counts
+	}
+	if success {
+		counts.Success++
+	} else {
+		counts.Failure++
+	}
 }
 
 func (s *RequestStatistics) updateAPIStats(stats *apiStats, model string, detail RequestDetail) {
@@ -424,6 +489,10 @@ func (s *RequestStatistics) recordImported(apiName, modelName string, stats *api
 	s.requestsByHour[hourKey]++
 	s.tokensByDay[dayKey] += totalTokens
 	s.tokensByHour[hourKey] += totalTokens
+
+	if authIndex := strings.TrimSpace(detail.AuthIndex); authIndex != "" {
+		s.updateAuthIndexStats(authIndex, detail.Timestamp, !detail.Failed)
+	}
 }
 
 func dedupKey(apiName, modelName string, detail RequestDetail) string {
