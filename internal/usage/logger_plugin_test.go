@@ -94,3 +94,89 @@ func TestRequestStatisticsMergeSnapshotDedupIgnoresLatency(t *testing.T) {
 		t.Fatalf("details len = %d, want 1", len(details))
 	}
 }
+
+func TestAuthIndexCountsSnapshotAggregatesRecentWindows(t *testing.T) {
+	stats := NewRequestStatistics()
+	now := time.Now().UTC()
+	currentWindow := now.Truncate(authIndexRequestWindowDuration)
+
+	stats.Record(context.Background(), coreusage.Record{
+		AuthIndex:   "auth-a",
+		RequestedAt: now.Add(-authIndexRequestWindowDuration),
+	})
+	stats.Record(context.Background(), coreusage.Record{
+		AuthIndex:   "auth-a",
+		RequestedAt: now,
+	})
+	stats.Record(context.Background(), coreusage.Record{
+		AuthIndex:   "auth-a",
+		RequestedAt: now,
+		Failed:      true,
+	})
+	stats.Record(context.Background(), coreusage.Record{
+		AuthIndex:   "auth-b",
+		RequestedAt: now,
+		Failed:      true,
+	})
+
+	snapshot := stats.AuthIndexCountsSnapshot()
+	authA := snapshot["auth-a"]
+	if authA.Success != 2 || authA.Failure != 1 {
+		t.Fatalf("auth-a counts = success:%d failure:%d, want 2/1", authA.Success, authA.Failure)
+	}
+	if len(authA.RecentRequests) != authIndexRequestWindowCount {
+		t.Fatalf("recent requests len = %d, want %d", len(authA.RecentRequests), authIndexRequestWindowCount)
+	}
+	for i, window := range authA.RecentRequests {
+		expectedTime := currentWindow.Add(time.Duration(i-(authIndexRequestWindowCount-1)) * authIndexRequestWindowDuration)
+		if !window.Time.Equal(expectedTime) {
+			t.Fatalf("window %d time = %s, want %s", i, window.Time, expectedTime)
+		}
+	}
+	previous := authA.RecentRequests[authIndexRequestWindowCount-2]
+	if previous.Success != 1 || previous.Failed != 0 {
+		t.Fatalf("previous window = success:%d failed:%d, want 1/0", previous.Success, previous.Failed)
+	}
+	current := authA.RecentRequests[authIndexRequestWindowCount-1]
+	if current.Success != 1 || current.Failed != 1 {
+		t.Fatalf("current window = success:%d failed:%d, want 1/1", current.Success, current.Failed)
+	}
+	authB := snapshot["auth-b"]
+	if authB.Success != 0 || authB.Failure != 1 {
+		t.Fatalf("auth-b counts = success:%d failure:%d, want 0/1", authB.Success, authB.Failure)
+	}
+	if currentB := authB.RecentRequests[authIndexRequestWindowCount-1]; currentB.Success != 0 || currentB.Failed != 1 {
+		t.Fatalf("auth-b current window = success:%d failed:%d, want 0/1", currentB.Success, currentB.Failed)
+	}
+}
+
+func TestMergeSnapshotUpdatesAuthIndexWindows(t *testing.T) {
+	stats := NewRequestStatistics()
+	now := time.Now().UTC()
+	result := stats.MergeSnapshot(StatisticsSnapshot{
+		APIs: map[string]APISnapshot{
+			"test-key": {
+				Models: map[string]ModelSnapshot{
+					"gpt-5.4": {
+						Details: []RequestDetail{
+							{Timestamp: now, AuthIndex: "auth-a"},
+							{Timestamp: now, AuthIndex: "auth-a", Failed: true},
+						},
+					},
+				},
+			},
+		},
+	})
+	if result.Added != 2 || result.Skipped != 0 {
+		t.Fatalf("merge = %+v, want added=2 skipped=0", result)
+	}
+
+	authA := stats.AuthIndexCountsSnapshot()["auth-a"]
+	if authA.Success != 1 || authA.Failure != 1 {
+		t.Fatalf("counts = success:%d failure:%d, want 1/1", authA.Success, authA.Failure)
+	}
+	current := authA.RecentRequests[authIndexRequestWindowCount-1]
+	if current.Success != 1 || current.Failed != 1 {
+		t.Fatalf("current window = success:%d failed:%d, want 1/1", current.Success, current.Failed)
+	}
+}
