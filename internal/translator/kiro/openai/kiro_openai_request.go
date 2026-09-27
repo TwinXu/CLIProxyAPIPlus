@@ -869,7 +869,14 @@ func checkThinkingModeFromOpenAI(openaiBody []byte) bool {
 // - Model name containing "thinking" or "reason"
 // - <thinking_mode> tag in system prompt (AMP/Cursor format)
 func checkThinkingModeFromOpenAIWithHeaders(openaiBody []byte, headers http.Header) bool {
-	// Check Anthropic-Beta header first (Claude CLI uses this)
+	// An explicit "off" in the body outranks the Anthropic-Beta header; see
+	// kiroclaude.IsThinkingEnabledWithHeaders.
+	if kiroclaude.IsThinkingExplicitlyDisabled(openaiBody) {
+		log.Debugf("kiro-openai: thinking mode explicitly disabled in body")
+		return false
+	}
+
+	// Check Anthropic-Beta header (Claude CLI uses this)
 	if kiroclaude.IsThinkingEnabledFromHeader(headers) {
 		log.Debugf("kiro-openai: thinking mode enabled via Anthropic-Beta header")
 		return true

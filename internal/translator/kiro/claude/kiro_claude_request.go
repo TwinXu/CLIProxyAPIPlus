@@ -600,6 +600,22 @@ func IsThinkingEnabledFromHeader(headers http.Header) bool {
 	return false
 }
 
+// IsThinkingExplicitlyDisabled reports whether the request body itself turns
+// thinking off: Claude's thinking.type="disabled" or a non-positive budget_tokens,
+// or OpenAI's reasoning_effort="none".
+func IsThinkingExplicitlyDisabled(body []byte) bool {
+	thinkingField := gjson.GetBytes(body, "thinking")
+	switch strings.ToLower(strings.TrimSpace(thinkingField.Get("type").String())) {
+	case "disabled":
+		return true
+	case "enabled":
+		if bt := thinkingField.Get("budget_tokens"); bt.Exists() && bt.Int() <= 0 {
+			return true
+		}
+	}
+	return strings.EqualFold(strings.TrimSpace(gjson.GetBytes(body, "reasoning_effort").String()), "none")
+}
+
 // IsThinkingEnabled is a public wrapper to check if thinking mode is enabled.
 // This is used by the executor to determine whether to parse <thinking> tags in responses.
 // When thinking is NOT enabled in the request, <thinking> tags in responses should be
@@ -620,7 +636,15 @@ func IsThinkingEnabled(body []byte) bool {
 // - AMP/Cursor format: <thinking_mode>interleaved</thinking_mode> in system prompt
 // - Anthropic-Beta header: interleaved-thinking-2025-05-14
 func IsThinkingEnabledWithHeaders(body []byte, headers http.Header) bool {
-	// Check Anthropic-Beta header first (Claude Code uses this)
+	// An explicit "off" in the body is this request's own setting and outranks the
+	// Anthropic-Beta header, which says only that the client can handle interleaved
+	// thinking. Checking the header first turned thinking.type="disabled" back on.
+	if IsThinkingExplicitlyDisabled(body) {
+		log.Debugf("kiro: IsThinkingEnabled returning false (explicitly disabled in body)")
+		return false
+	}
+
+	// Check Anthropic-Beta header (Claude Code uses this)
 	if IsThinkingEnabledFromHeader(headers) {
 		return true
 	}
