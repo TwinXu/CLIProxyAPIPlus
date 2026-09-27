@@ -438,3 +438,31 @@ func TestFilterOrphanedToolResults_RemovesHistoryAndCurrentOrphans(t *testing.T)
 		t.Fatalf("expected current tool results to keep only keep-1, got: %+v", filteredCurrent)
 	}
 }
+
+// The OpenAI builder resolves max_tokens=-1 the same way the Claude builder does.
+func TestBuildKiroPayloadFromOpenAIMaxTokensMinusOneUsesModelCeiling(t *testing.T) {
+	for _, tc := range []struct {
+		modelID string
+		want    int64
+	}{
+		{"claude-opus-5.5", 128000},
+		{"claude-sonnet-4.6", 64000},
+		{"brand-new-model", 32000},
+	} {
+		t.Run(tc.modelID, func(t *testing.T) {
+			body := []byte(`{"model":"x","max_tokens":-1,"messages":[{"role":"user","content":"hi"}]}`)
+			payload, _ := BuildKiroPayloadFromOpenAI(body, tc.modelID, "arn:test", "AI_EDITOR", false, false, nil, nil)
+			var parsed struct {
+				InferenceConfig struct {
+					MaxTokens int64 `json:"maxTokens"`
+				} `json:"inferenceConfig"`
+			}
+			if err := json.Unmarshal(payload, &parsed); err != nil {
+				t.Fatalf("unmarshal payload: %v", err)
+			}
+			if parsed.InferenceConfig.MaxTokens != tc.want {
+				t.Fatalf("inferenceConfig.maxTokens = %d, want %d\npayload: %s", parsed.InferenceConfig.MaxTokens, tc.want, payload)
+			}
+		})
+	}
+}

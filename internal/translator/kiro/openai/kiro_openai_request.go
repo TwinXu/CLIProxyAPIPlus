@@ -147,14 +147,13 @@ func ConvertOpenAIRequestToKiro(modelName string, inputRawJSON []byte, stream bo
 // Returns the payload and a boolean indicating whether thinking mode was injected.
 func BuildKiroPayloadFromOpenAI(openaiBody []byte, modelID, profileArn, origin string, isAgentic, isChatOnly bool, headers http.Header, metadata map[string]any) ([]byte, bool) {
 	// Extract max_tokens for potential use in inferenceConfig
-	// Handle -1 as "use maximum" (Kiro max output is ~32000 tokens)
-	const kiroMaxOutputTokens = 32000
+	// Handle -1 as "use maximum" for this model (see kiroclaude.KiroMaxOutputTokens)
 	var maxTokens int64
 	if mt := gjson.GetBytes(openaiBody, "max_tokens"); mt.Exists() {
 		maxTokens = mt.Int()
 		if maxTokens == -1 {
-			maxTokens = kiroMaxOutputTokens
-			log.Debugf("kiro-openai: max_tokens=-1 converted to %d", kiroMaxOutputTokens)
+			maxTokens = kiroclaude.KiroMaxOutputTokens(modelID)
+			log.Debugf("kiro-openai: max_tokens=-1 converted to %d", maxTokens)
 		}
 	}
 

@@ -185,14 +185,13 @@ func ConvertClaudeRequestToKiro(modelName string, inputRawJSON []byte, stream bo
 // Returns the payload and a boolean indicating whether thinking mode was injected.
 func BuildKiroPayload(claudeBody []byte, modelID, profileArn, origin string, isAgentic, isChatOnly bool, headers http.Header, metadata map[string]any) ([]byte, bool) {
 	// Extract max_tokens for potential use in inferenceConfig
-	// Handle -1 as "use maximum" (Kiro max output is ~32000 tokens)
-	const kiroMaxOutputTokens = 32000
+	// Handle -1 as "use maximum" for this model (see KiroMaxOutputTokens)
 	var maxTokens int64
 	if mt := gjson.GetBytes(claudeBody, "max_tokens"); mt.Exists() {
 		maxTokens = mt.Int()
 		if maxTokens == -1 {
-			maxTokens = kiroMaxOutputTokens
-			log.Debugf("kiro: max_tokens=-1 converted to %d", kiroMaxOutputTokens)
+			maxTokens = KiroMaxOutputTokens(modelID)
+			log.Debugf("kiro: max_tokens=-1 converted to %d", maxTokens)
 		}
 	}
 
@@ -405,6 +404,25 @@ func BuildKiroPayload(claudeBody []byte, modelID, profileArn, origin string, isA
 	}
 
 	return result, thinkingEnabled
+}
+
+// defaultKiroMaxOutputTokens is what max_tokens=-1 resolves to for a model the
+// Kiro catalogue does not describe. It is the ceiling every model used to get.
+const defaultKiroMaxOutputTokens = 32000
+
+// KiroMaxOutputTokens returns the output ceiling that max_tokens=-1 ("use the
+// maximum") resolves to for a Kiro backend model id.
+//
+// A fixed 32000 was a quarter of what the Opus 4.7/4.8/5/5.5 tier accepts and
+// half of what every other current Claude model does, so "use the maximum"
+// quietly meant "use a fraction of it". The catalogue entry records each model's
+// ceiling; none of its values exceeds what ListAvailableModels reports, so the
+// resolved number is never one the backend rejects.
+func KiroMaxOutputTokens(modelID string) int64 {
+	if info := registry.LookupKiroModelInfo(modelID); info != nil && info.MaxCompletionTokens > 0 {
+		return int64(info.MaxCompletionTokens)
+	}
+	return defaultKiroMaxOutputTokens
 }
 
 // BuildKiroAdditionalFields decides what, if anything, to send in

@@ -53,3 +53,28 @@ func TestBuildKiroPayloadAdaptiveEffortNoneDisables(t *testing.T) {
 		t.Fatalf("effort=none must not inject thinking prompt, content=%s", content)
 	}
 }
+
+// max_tokens=-1 means "use the maximum", which is the model's own ceiling. A fixed
+// 32000 capped the Opus 4.7+/5/5.5 tier at a quarter of what it accepts. The
+// model ids here are backend spellings, as mapModelToKiro hands them over.
+func TestBuildKiroPayloadMaxTokensMinusOneUsesModelCeiling(t *testing.T) {
+	for _, tc := range []struct {
+		modelID string
+		want    int64
+	}{
+		{"claude-opus-5.5", 128000},
+		{"claude-opus-5", 128000},
+		{"claude-sonnet-4.6", 64000},
+		{"claude-haiku-4.5", 64000},
+		// Not in the catalogue: keep the old ceiling rather than guess.
+		{"brand-new-model", 32000},
+	} {
+		t.Run(tc.modelID, func(t *testing.T) {
+			body := []byte(`{"model":"x","max_tokens":-1,"messages":[{"role":"user","content":"hi"}]}`)
+			payload, _ := BuildKiroPayload(body, tc.modelID, "arn:test", "AI_EDITOR", false, false, nil, nil)
+			if got := gjson.GetBytes(payload, "inferenceConfig.maxTokens").Int(); got != tc.want {
+				t.Fatalf("inferenceConfig.maxTokens = %d, want %d\npayload: %s", got, tc.want, payload)
+			}
+		})
+	}
+}
