@@ -1228,6 +1228,7 @@ func TestStreamToChannel_KiroCacheUsagePreservesOfficialTokenUsage(t *testing.T)
 		out,
 		sdktranslator.FromString("claude"),
 		"claude-sonnet-4",
+		"claude-sonnet-4",
 		nil,
 		[]byte(`{"messages":[]}`),
 		nil,
@@ -1293,6 +1294,7 @@ func TestStreamToChannel_EstimatesCacheFromCreditsBranchB(t *testing.T) {
 		out,
 		sdktranslator.FromString("claude"),
 		"claude-sonnet-4.5",
+		"claude-sonnet-4.5",
 		nil,
 		[]byte(`{"messages":[]}`),
 		nil,
@@ -1347,6 +1349,7 @@ func TestStreamToChannel_IgnoresNonCreditMeteringEvents(t *testing.T) {
 		bytes.NewReader(stream.Bytes()),
 		out,
 		sdktranslator.FromString("claude"),
+		"claude-sonnet-4",
 		"claude-sonnet-4",
 		nil,
 		[]byte(`{"messages":[]}`),
@@ -1635,5 +1638,104 @@ func TestEndpointAliases(t *testing.T) {
 	// Verify no unexpected aliases
 	if len(endpointAliases) != len(expectedAliases) {
 		t.Errorf("unexpected number of aliases: got %d, want %d", len(endpointAliases), len(expectedAliases))
+	}
+}
+
+// contextUsagePercentage is measured against each model's own context window.
+// These pin the window per model, including the spellings that reach usage
+// accounting: the resolved upstream name with a thinking suffix, and the
+// backend's dotted id.
+func TestKiroContextWindowForModel(t *testing.T) {
+	for _, tc := range []struct {
+		model string
+		want  int64
+	}{
+		{"kiro-claude-opus-5-5", 1000000},
+		{"claude-opus-5.5", 1000000},
+		{"kiro-claude-opus-5-5-agentic(high)", 1000000},
+		{"kiro-claude-opus-5", 1000000},
+		{"kiro-claude-sonnet-4-6", 1000000},
+		{"kiro-claude-sonnet-4-5", 200000},
+		{"claude-haiku-4.5", 200000},
+		// Unknown to the catalogue: keep the old assumption rather than guess.
+		{"kiro-brand-new-model", 200000},
+		{"opus", 200000},
+	} {
+		t.Run(tc.model, func(t *testing.T) {
+			if got := kiroContextWindowForModel(tc.model); got != tc.want {
+				t.Fatalf("kiroContextWindowForModel(%q) = %d, want %d", tc.model, got, tc.want)
+			}
+		})
+	}
+}
+
+// Measured on the live backend: the same prose block raised contextUsagePercentage
+// by 2.034 on sonnet-4.6 (1M) and 10.17 on sonnet-4.5 (200K) -- about 20,340
+// tokens both times. With the old fixed 200K base the 1M model read as a fifth of
+// that. (The fixtures use exactly representable percentages.)
+func TestParseEventStream_ContextPercentageUsesModelWindow(t *testing.T) {
+	for _, tc := range []struct {
+		model string
+		pct   string
+		want  int64
+	}{
+		{"kiro-claude-sonnet-4-6", "2.5", 25000},
+		{"kiro-claude-sonnet-4-5", "12.5", 25000},
+	} {
+		t.Run(tc.model, func(t *testing.T) {
+			var stream bytes.Buffer
+			writeKiroTestEvent(t, &stream, "assistantResponseEvent", []byte(`{"assistantResponseEvent":{"content":"OK"}}`))
+			writeKiroTestEvent(t, &stream, "contextUsageEvent", []byte(`{"contextUsageEvent":{"contextUsagePercentage":`+tc.pct+`}}`))
+			parsed, err := (&KiroExecutor{}).parseEventStream(bytes.NewReader(stream.Bytes()), tc.model)
+			if err != nil {
+				t.Fatalf("parseEventStream() error = %v", err)
+			}
+			if parsed.Usage.InputTokens != tc.want {
+				t.Fatalf("InputTokens = %d, want %d", parsed.Usage.InputTokens, tc.want)
+			}
+		})
+	}
+}
+
+// The streaming path echoes the client's requested name, which may be a user
+// alias that names no model at all. Usage accounting must key on the resolved
+// model instead: here the alias "opus" would size the window at the 200K
+// fallback and report a fifth of the real input.
+func TestStreamToChannel_UsageKeysOnResolvedModel(t *testing.T) {
+	var stream bytes.Buffer
+	writeKiroTestEvent(t, &stream, "assistantResponseEvent", []byte(`{"assistantResponseEvent":{"content":"OK"}}`))
+	writeKiroTestEvent(t, &stream, "contextUsageEvent", []byte(`{"contextUsageEvent":{"contextUsagePercentage":2.5}}`))
+
+	out := make(chan cliproxyexecutor.StreamChunk, 16)
+	executor := &KiroExecutor{}
+	executor.streamToChannel(
+		context.Background(),
+		bytes.NewReader(stream.Bytes()),
+		out,
+		sdktranslator.FromString("claude"),
+		"opus",
+		"kiro-claude-sonnet-4-6",
+		nil,
+		[]byte(`{"messages":[]}`),
+		nil,
+		false,
+	)
+	close(out)
+
+	var messageDelta string
+	for chunk := range out {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error = %v", chunk.Err)
+		}
+		payload := string(chunk.Payload)
+		if strings.HasPrefix(payload, "event: message_delta\ndata: ") {
+			messageDelta = strings.TrimSpace(strings.TrimPrefix(payload, "event: message_delta\ndata: "))
+		}
+	}
+	if messageDelta == "" {
+		t.Fatal("expected message_delta event")
+	}
+	if got := gjson.Get(messageDelta, "usage.input_tokens").Int(); got != 25000 {
+		t.Fatalf("usage.input_tokens = %d, want 25000 (window of the resolved 1M model)", got)
 	}
 }

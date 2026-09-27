@@ -1547,7 +1547,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 				// So we always enable thinking parsing for Kiro responses
 				log.Debugf("kiro: stream thinkingEnabled = %v (always true for Kiro)", thinkingEnabled)
 
-				e.streamToChannel(ctx, resp.Body, out, from, payloadRequestedModel(opts, req.Model), opts.OriginalRequest, body, reporter, thinkingEnabled)
+				e.streamToChannel(ctx, resp.Body, out, from, payloadRequestedModel(opts, req.Model), req.Model, opts.OriginalRequest, body, reporter, thinkingEnabled)
 			}(httpResp, thinkingEnabled)
 
 			return out, nil
@@ -1980,6 +1980,27 @@ func (e *KiroExecutor) mapModelToKiro(model string) (string, error) {
 		code: http.StatusBadRequest,
 		msg:  fmt.Sprintf("kiro: unsupported model %q (resolved to %q); the Kiro backend does not serve it", model, name),
 	}
+}
+
+// kiroContextWindowForModel returns the context window, in tokens, that Kiro's
+// contextUsagePercentage is measured against for the given model.
+//
+// It is each model's own maxInputTokens, not a fixed 200K. Measured 2026-09-27 by
+// adding the same ~95K-character prose block to a minimal request: the reported
+// percentage rose by 10.17 points on claude-haiku-4.5 and claude-sonnet-4.5
+// (200K windows) but by 2.034 on claude-sonnet-4.6 (1M), which shares their
+// tokenizer -- 20,341 tokens either way, but only when each is divided by its own
+// window. The former fixed 200K base therefore reported a fifth of the real input
+// for every 1M-context model, which is every current Claude model on Kiro.
+//
+// The catalogue entry is where that window is recorded; a model it does not
+// describe keeps the old 200K assumption.
+func kiroContextWindowForModel(model string) int64 {
+	name := thinking.ParseSuffix(strings.TrimSpace(model)).ModelName
+	if info := registry.LookupKiroModelInfo(name); info != nil && info.ContextLength > 0 {
+		return int64(info.ContextLength)
+	}
+	return registry.DefaultKiroContextLength
 }
 
 // kiroCreditUSDForModel returns the empirical USD-equivalence of one Kiro
@@ -2945,11 +2966,11 @@ func (e *KiroExecutor) parseEventStream(body io.Reader, model string) (kiroNonSt
 		log.Warnf("kiro: response truncated due to max_tokens limit")
 	}
 
-	// Use contextUsagePercentage to calculate more accurate input tokens
-	// Kiro model has 200k max context, contextUsagePercentage represents the percentage used
-	// Formula: input_tokens = contextUsagePercentage * 200000 / 100
+	// Use contextUsagePercentage to calculate more accurate input tokens.
+	// The percentage is of the model's own context window; see
+	// kiroContextWindowForModel.
 	if upstreamContextPercentage > 0 && !hasOfficialTokenUsage {
-		calculatedInputTokens := int64(upstreamContextPercentage * 200000 / 100)
+		calculatedInputTokens := int64(upstreamContextPercentage * float64(kiroContextWindowForModel(model)) / 100)
 		if calculatedInputTokens > 0 {
 			localEstimate := usageInfo.InputTokens
 			usageInfo.InputTokens = calculatedInputTokens
@@ -3186,7 +3207,13 @@ func (e *KiroExecutor) extractEventTypeFromBytes(headers []byte) string {
 // Implements duplicate content filtering using lastContentEvent detection (based on AIClient-2-API).
 // Extracts stop_reason from upstream events when available.
 // thinkingEnabled controls whether <thinking> tags are parsed - only parse when request enabled thinking.
-func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out chan<- cliproxyexecutor.StreamChunk, targetFormat sdktranslator.Format, model string, originalReq, claudeBody []byte, reporter *usageReporter, thinkingEnabled bool) {
+//
+// model is the name the client asked for and is what the translated events echo
+// back. usageModel is the name the conductor resolved it to, and is what usage
+// accounting must key on: a user alias such as "opus" says nothing about which
+// Opus answered, and pricing or sizing the context window from it silently picks
+// the wrong model.
+func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out chan<- cliproxyexecutor.StreamChunk, targetFormat sdktranslator.Format, model, usageModel string, originalReq, claudeBody []byte, reporter *usageReporter, thinkingEnabled bool) {
 	reader := bufio.NewReaderSize(body, 20*1024*1024) // 20MB buffer to match other providers
 	var totalUsage usage.Detail
 	var hasToolUses bool          // Track if any tool uses were emitted
@@ -4271,14 +4298,11 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 		}
 	}
 
-	// Use contextUsagePercentage to calculate more accurate input tokens
-	// Kiro model has 200k max context, contextUsagePercentage represents the percentage used
-	// Formula: input_tokens = contextUsagePercentage * 200000 / 100
-	// Note: The effective input context is ~170k (200k - 30k reserved for output)
+	// Use contextUsagePercentage to calculate more accurate input tokens.
+	// The percentage is of the model's own context window; see
+	// kiroContextWindowForModel.
 	if upstreamContextPercentage > 0 && !hasOfficialTokenUsage {
-		// Calculate input tokens from context percentage
-		// Using 200k as the base since that's what Kiro reports against
-		calculatedInputTokens := int64(upstreamContextPercentage * 200000 / 100)
+		calculatedInputTokens := int64(upstreamContextPercentage * float64(kiroContextWindowForModel(usageModel)) / 100)
 
 		// Only use calculated value if it's significantly different from local estimate
 		// This provides more accurate token counts based on upstream data
@@ -4303,7 +4327,7 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 	// never sends those fields.
 	_, _ = hasOfficialCacheRead, hasOfficialCacheWrite
 	if hasUncachedInputTokens || (totalUsage.InputTokens > 0 && upstreamCreditUsage > 0) {
-		totalUsage, estimatedCacheRead, estimatedCacheWrite = estimateKiroCacheUsage(model, totalUsage, upstreamCreditUsage, hasUncachedInputTokens)
+		totalUsage, estimatedCacheRead, estimatedCacheWrite = estimateKiroCacheUsage(usageModel, totalUsage, upstreamCreditUsage, hasUncachedInputTokens)
 	}
 
 	// Update TotalTokens when upstream did not provide an authoritative total.
