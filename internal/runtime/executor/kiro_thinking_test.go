@@ -54,37 +54,48 @@ func TestApplyKiroThinkingHonoursSuffix(t *testing.T) {
 // This replaces a tripwire that asserted the opposite -- that the effort was
 // dropped and never reached the backend.
 func TestKiroEffortReachesTheBackend(t *testing.T) {
-	const body = `{"model":"kiro-claude-opus-5","max_tokens":1024,"messages":[{"role":"user","content":"hi"}]}`
+	// backendID is what mapModelToKiro hands the payload builder. opus-5.5 is
+	// here for its dotted id: BuildKiroAdditionalFields resolves capabilities
+	// from that spelling, and a lookup that failed to fold it would drop the
+	// effort without any error.
+	for _, tc := range []struct{ model, backendID string }{
+		{"kiro-claude-opus-5", "claude-opus-5"},
+		{"kiro-claude-opus-5-5", "claude-opus-5.5"},
+	} {
+		t.Run(tc.model, func(t *testing.T) {
+			body := `{"model":"` + tc.model + `","max_tokens":1024,"messages":[{"role":"user","content":"hi"}]}`
 
-	applied, err := applyKiroThinking([]byte(body), "kiro-claude-opus-5(xhigh)", "claude")
-	if err != nil {
-		t.Fatalf("applyKiroThinking: %v", err)
-	}
+			applied, err := applyKiroThinking([]byte(body), tc.model+"(xhigh)", "claude")
+			if err != nil {
+				t.Fatalf("applyKiroThinking: %v", err)
+			}
 
-	payload, thinkingEnabled := kiroclaude.BuildKiroPayload(applied, "claude-opus-5", "arn:test", "AI_EDITOR", false, false, nil, nil)
+			payload, thinkingEnabled := kiroclaude.BuildKiroPayload(applied, tc.backendID, "arn:test", "AI_EDITOR", false, false, nil, nil)
 
-	// Assert the payload was really built before reading fields out of it: an
-	// empty or bailed-out payload would fail these checks for the wrong reason.
-	if !gjson.GetBytes(payload, "conversationState.currentMessage").Exists() {
-		t.Fatalf("payload was not built\npayload: %s", payload)
-	}
-	if !thinkingEnabled {
-		t.Fatalf("adaptive thinking should register as enabled\npayload: %s", payload)
-	}
-	if got := gjson.GetBytes(payload, "additionalModelRequestFields.output_config.effort").String(); got != "xhigh" {
-		t.Fatalf("forwarded effort = %q, want xhigh\npayload: %s", got, payload)
-	}
-	if got := gjson.GetBytes(payload, "additionalModelRequestFields.thinking.type").String(); got != "adaptive" {
-		t.Fatalf("forwarded thinking.type = %q, want adaptive\npayload: %s", got, payload)
-	}
-	// Without display the backend suppresses reasoningContentEvent entirely, so
-	// enabling thinking without it would be worse than not enabling it at all.
-	if got := gjson.GetBytes(payload, "additionalModelRequestFields.thinking.display").String(); got != "summarized" {
-		t.Fatalf("forwarded thinking.display = %q, want summarized\npayload: %s", got, payload)
-	}
-	// The Claude-shaped originals must still be stripped -- Kiro rejects them.
-	if gjson.GetBytes(payload, "output_config").Exists() || gjson.GetBytes(payload, "thinking").Exists() {
-		t.Fatalf("Claude-shaped thinking fields must not survive at the top level\npayload: %s", payload)
+			// Assert the payload was really built before reading fields out of it: an
+			// empty or bailed-out payload would fail these checks for the wrong reason.
+			if !gjson.GetBytes(payload, "conversationState.currentMessage").Exists() {
+				t.Fatalf("payload was not built\npayload: %s", payload)
+			}
+			if !thinkingEnabled {
+				t.Fatalf("adaptive thinking should register as enabled\npayload: %s", payload)
+			}
+			if got := gjson.GetBytes(payload, "additionalModelRequestFields.output_config.effort").String(); got != "xhigh" {
+				t.Fatalf("forwarded effort = %q, want xhigh\npayload: %s", got, payload)
+			}
+			if got := gjson.GetBytes(payload, "additionalModelRequestFields.thinking.type").String(); got != "adaptive" {
+				t.Fatalf("forwarded thinking.type = %q, want adaptive\npayload: %s", got, payload)
+			}
+			// Without display the backend suppresses reasoningContentEvent entirely, so
+			// enabling thinking without it would be worse than not enabling it at all.
+			if got := gjson.GetBytes(payload, "additionalModelRequestFields.thinking.display").String(); got != "summarized" {
+				t.Fatalf("forwarded thinking.display = %q, want summarized\npayload: %s", got, payload)
+			}
+			// The Claude-shaped originals must still be stripped -- Kiro rejects them.
+			if gjson.GetBytes(payload, "output_config").Exists() || gjson.GetBytes(payload, "thinking").Exists() {
+				t.Fatalf("Claude-shaped thinking fields must not survive at the top level\npayload: %s", payload)
+			}
+		})
 	}
 }
 

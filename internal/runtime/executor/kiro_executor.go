@@ -1896,7 +1896,10 @@ var kiroModelIDs = map[string]string{
 	// Backend-side router.
 	"auto": "auto",
 
-	// Anthropic — current generation.
+	// Anthropic — current generation. claude-opus-5.5 was verified against
+	// ListAvailableModels on 2026-09-27; unlike claude-opus-5 its backend id is
+	// dotted, so the dashed key is what every client spelling folds onto.
+	"claude-opus-5-5": "claude-opus-5.5",
 	"claude-opus-5":   "claude-opus-5",
 	"claude-sonnet-5": "claude-sonnet-5",
 
@@ -2021,6 +2024,18 @@ type kiroTokenPrice struct {
 func kiroTokenPriceForModel(model string) kiroTokenPrice {
 	modelLower := strings.ToLower(model)
 	switch {
+	case strings.Contains(strings.ReplaceAll(modelLower, ".", "-"), "opus-5-5"):
+		// Opus 5.5 is cheaper than the rest of the Opus line, and its cache reads
+		// are 0.05x input rather than 0.1x. These match sub2api's claude-opus-5-5
+		// entry, which is what bills the counts this estimator forwards, so any
+		// drift here turns straight into a mis-billed cache split.
+		return kiroTokenPrice{
+			inputPerMTok:        4.0,
+			outputPerMTok:       20.0,
+			cacheWritePerMTok:   5.0, // 5-min
+			cacheWrite1HPerMTok: 8.0, // 1-hour
+			cacheReadPerMTok:    0.20,
+		}
 	case strings.Contains(modelLower, "haiku"):
 		return kiroTokenPrice{
 			inputPerMTok:        1.0,

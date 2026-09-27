@@ -16,7 +16,7 @@ package registry
 const (
 	// KiroModernContextLength is the context window Claude 4.6+ reports on Kiro.
 	KiroModernContextLength = 1000000
-	// KiroModernMaxOutputLarge is the output ceiling for the Opus 4.7/4.8/5 tier.
+	// KiroModernMaxOutputLarge is the output ceiling for the Opus 4.7/4.8/5/5.5 tier.
 	KiroModernMaxOutputLarge = 128000
 	// KiroModernMaxOutputStandard is the output ceiling for Sonnet and Opus 4.6.
 	KiroModernMaxOutputStandard = 64000
@@ -43,7 +43,7 @@ func KiroEffortThinking(levels []string) *ThinkingSupport {
 	}
 }
 
-// KiroThinkingWithXHigh returns the effort support shared by Claude 4.7, 4.8 and 5.
+// KiroThinkingWithXHigh returns the effort support shared by Claude 4.7, 4.8, 5 and 5.5.
 func KiroThinkingWithXHigh() *ThinkingSupport { return KiroEffortThinking(kiroEffortLevelsWithXHigh) }
 
 // KiroThinking46 returns the effort support for the Claude 4.6 pair.

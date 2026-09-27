@@ -780,6 +780,16 @@ func TestKiroMapModelToKiroCurrentGeneration(t *testing.T) {
 	}{
 		{"claude-opus-5", "claude-opus-5"},
 		{"claude-sonnet-5", "claude-sonnet-5"},
+		// Opus 5.5 is dotted on the backend. Clients address it by the dashed
+		// catalogue id; the dotted form is the backend's own spelling, and any
+		// name that does reach this function must still fold onto it.
+		{"claude-opus-5-5", "claude-opus-5.5"},
+		{"claude-opus-5.5", "claude-opus-5.5"},
+		{"kiro-claude-opus-5-5", "claude-opus-5.5"},
+		{"amazonq-claude-opus-5-5", "claude-opus-5.5"},
+		{"KIRO-CLAUDE-OPUS-5-5-AGENTIC", "claude-opus-5.5"},
+		{"claude-opus-5-5-chat", "claude-opus-5.5"},
+		{"claude-opus-5-5(high)", "claude-opus-5.5"},
 		{"kiro-claude-opus-5", "claude-opus-5"},
 		{"amazonq-claude-opus-5", "claude-opus-5"},
 		{"claude-opus-5-agentic", "claude-opus-5"},
@@ -842,6 +852,35 @@ func TestKiroMapModelToKiroRejectsUnknown(t *testing.T) {
 			}
 			if got != "" {
 				t.Fatalf("mapModelToKiro(%q) returned %q alongside an error, want empty", model, got)
+			}
+		})
+	}
+}
+
+// Opus 5.5 is priced below the rest of the Opus line, and its forwarded cache
+// counts are billed downstream by sub2api at these rates. Each spelling that
+// reaches the estimator must pick them up, and the neighbouring Opus models must
+// not: "opus-5" and "opus-4-5" are both substrings a loose match could trip on.
+func TestKiroTokenPriceForModel_Opus55(t *testing.T) {
+	opus55 := kiroTokenPrice{inputPerMTok: 4.0, outputPerMTok: 20.0, cacheWritePerMTok: 5.0, cacheWrite1HPerMTok: 8.0, cacheReadPerMTok: 0.20}
+	opus := kiroTokenPrice{inputPerMTok: 5.0, outputPerMTok: 25.0, cacheWritePerMTok: 6.25, cacheWrite1HPerMTok: 10.0, cacheReadPerMTok: 0.50}
+	for _, tc := range []struct {
+		model string
+		want  kiroTokenPrice
+	}{
+		{"claude-opus-5-5", opus55},
+		{"claude-opus-5.5", opus55},
+		{"kiro-claude-opus-5-5", opus55},
+		{"KIRO-CLAUDE-OPUS-5-5-AGENTIC", opus55},
+		{"claude-opus-5-5(high)", opus55},
+		{"claude-opus-5", opus},
+		{"kiro-claude-opus-5-agentic", opus},
+		{"claude-opus-4-5", opus},
+		{"claude-opus-4.5", opus},
+	} {
+		t.Run(tc.model, func(t *testing.T) {
+			if got := kiroTokenPriceForModel(tc.model); got != tc.want {
+				t.Fatalf("kiroTokenPriceForModel(%q) = %+v, want %+v", tc.model, got, tc.want)
 			}
 		})
 	}

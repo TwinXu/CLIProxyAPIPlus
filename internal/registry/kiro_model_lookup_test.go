@@ -11,6 +11,7 @@ func TestLookupKiroModelInfoFoldsBackendSpelling(t *testing.T) {
 		"claude-opus-4.8", "claude-opus-4.7", "claude-opus-4.6",
 		"kiro-claude-opus-4-8", "KIRO-CLAUDE-OPUS-4-8",
 		"claude-opus-5", "kiro-claude-opus-5-agentic", "amazonq-claude-opus-4-8",
+		"claude-opus-5.5", "kiro-claude-opus-5-5-agentic",
 	} {
 		t.Run(name, func(t *testing.T) {
 			info := LookupKiroModelInfo(name)
