@@ -491,6 +491,31 @@ type KiroExecutor struct {
 	profileArnMu sync.Mutex // Serializes profileArn fetches to prevent concurrent map writes
 }
 
+// checkKiroSourceFormat rejects a request in a format no Kiro translator reads.
+//
+// Only OpenAI Chat Completions and Claude Messages translate to Kiro. Anything
+// else -- an OpenAI Responses body is the one that happens in practice -- is
+// passed through untouched by TranslateRequest and then read by the Claude
+// builder, which finds no "messages" and sends the backend a placeholder
+// "Continue" in place of what the user wrote. The HTTP /v1/responses route is
+// bridged through Chat Completions before it gets here (Kiro models declare
+// chat-only endpoints), so this guards the paths that are not: the Responses
+// websocket and compact endpoints, and any other handler format.
+//
+// The message carries invalid_request_error so the conductor treats it as the
+// client-side error it is instead of retrying it on every other Kiro auth.
+func checkKiroSourceFormat(from sdktranslator.Format) error {
+	switch from.String() {
+	case "", "claude", "openai", "kiro":
+		return nil
+	}
+	msg, _ := json.Marshal(map[string]any{"error": map[string]string{
+		"type":    "invalid_request_error",
+		"message": fmt.Sprintf("kiro: request format %q is not supported; use /v1/chat/completions or /v1/messages", from.String()),
+	}})
+	return statusErr{code: http.StatusBadRequest, msg: string(msg)}
+}
+
 // buildKiroPayloadForFormat builds the Kiro API payload based on the source format.
 // This is critical because OpenAI and Claude formats have different tool structures:
 // - OpenAI: tools[].function.name, tools[].function.description
@@ -703,6 +728,9 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	// would otherwise attribute a purely client-side name error to this account.
 	kiroModelID, err := e.mapModelToKiro(req.Model)
 	if err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+	if err = checkKiroSourceFormat(opts.SourceFormat); err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
 
@@ -1184,6 +1212,9 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	// would otherwise attribute a purely client-side name error to this account.
 	kiroModelID, err := e.mapModelToKiro(req.Model)
 	if err != nil {
+		return nil, err
+	}
+	if err = checkKiroSourceFormat(opts.SourceFormat); err != nil {
 		return nil, err
 	}
 

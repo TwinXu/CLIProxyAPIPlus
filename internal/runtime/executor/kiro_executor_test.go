@@ -1641,6 +1641,33 @@ func TestEndpointAliases(t *testing.T) {
 	}
 }
 
+// Only Claude Messages and OpenAI Chat Completions translate to Kiro. Any other
+// format used to reach the Claude builder untranslated -- an OpenAI Responses
+// body lost its "input" and the backend was sent a placeholder instead -- so it
+// must be refused, as a client error the conductor will not retry on other auths.
+func TestCheckKiroSourceFormat(t *testing.T) {
+	for _, format := range []string{"", "claude", "openai", "kiro"} {
+		if err := checkKiroSourceFormat(sdktranslator.FromString(format)); err != nil {
+			t.Errorf("format %q rejected: %v", format, err)
+		}
+	}
+	for _, format := range []string{"openai-response", "gemini", "gemini-cli"} {
+		err := checkKiroSourceFormat(sdktranslator.FromString(format))
+		if err == nil {
+			t.Errorf("format %q accepted, want a 400", format)
+			continue
+		}
+		se, ok := err.(statusErr)
+		if !ok || se.StatusCode() != http.StatusBadRequest {
+			t.Errorf("format %q: got %#v, want statusErr 400", format, err)
+		}
+		// The conductor only stops retrying a 400 whose text carries this marker.
+		if !strings.Contains(err.Error(), "invalid_request_error") {
+			t.Errorf("format %q: error %q lacks invalid_request_error", format, err.Error())
+		}
+	}
+}
+
 // contextUsagePercentage is measured against each model's own context window.
 // These pin the window per model, including the spellings that reach usage
 // accounting: the resolved upstream name with a thinking suffix, and the

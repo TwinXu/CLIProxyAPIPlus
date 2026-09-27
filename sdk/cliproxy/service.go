@@ -976,7 +976,7 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 		models = executor.FetchGitHubCopilotModels(ctx, a, s.cfg)
 		models = applyExcludedModels(models, excluded)
 	case "kiro":
-		models = s.fetchKiroModels(a)
+		models = markKiroModelsChatOnly(s.fetchKiroModels(a))
 		models = applyExcludedModels(models, excluded)
 	case "kilo":
 		models = executor.FetchKiloModels(context.Background(), a, s.cfg)
@@ -1604,6 +1604,23 @@ func applyOAuthModelAlias(cfg *config.Config, provider, authKind string, models 
 		}
 	}
 	return out
+}
+
+// markKiroModelsChatOnly declares /chat/completions as the only OpenAI endpoint
+// each Kiro model serves.
+//
+// Kiro has translators for OpenAI Chat Completions and Claude Messages only. A
+// model that declares no endpoints leaves /v1/responses on its raw path, where
+// the Responses body reaches the Kiro executor untranslated; declaring chat-only
+// makes the handler bridge it through Chat Completions instead, which Kiro does
+// translate. Alias and prefix clones are shallow copies and inherit the list.
+func markKiroModelsChatOnly(models []*ModelInfo) []*ModelInfo {
+	for _, m := range models {
+		if m != nil && len(m.SupportedEndpoints) == 0 {
+			m.SupportedEndpoints = []string{"/chat/completions"}
+		}
+	}
+	return models
 }
 
 // fetchKiroModels attempts to dynamically fetch Kiro models from the API.
