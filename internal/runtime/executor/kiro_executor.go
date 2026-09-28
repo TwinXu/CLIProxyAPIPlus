@@ -491,6 +491,31 @@ type KiroExecutor struct {
 	profileArnMu sync.Mutex // Serializes profileArn fetches to prevent concurrent map writes
 }
 
+// checkKiroSourceFormat rejects a request in a format no Kiro translator reads.
+//
+// Only OpenAI Chat Completions and Claude Messages translate to Kiro. Anything
+// else -- an OpenAI Responses body is the one that happens in practice -- is
+// passed through untouched by TranslateRequest and then read by the Claude
+// builder, which finds no "messages" and sends the backend a placeholder
+// "Continue" in place of what the user wrote. The HTTP /v1/responses route is
+// bridged through Chat Completions before it gets here (Kiro models declare
+// chat-only endpoints), so this guards the paths that are not: the Responses
+// websocket and compact endpoints, and any other handler format.
+//
+// The message carries invalid_request_error so the conductor treats it as the
+// client-side error it is instead of retrying it on every other Kiro auth.
+func checkKiroSourceFormat(from sdktranslator.Format) error {
+	switch from.String() {
+	case "", "claude", "openai", "kiro":
+		return nil
+	}
+	msg, _ := json.Marshal(map[string]any{"error": map[string]string{
+		"type":    "invalid_request_error",
+		"message": fmt.Sprintf("kiro: request format %q is not supported; use /v1/chat/completions or /v1/messages", from.String()),
+	}})
+	return statusErr{code: http.StatusBadRequest, msg: string(msg)}
+}
+
 // buildKiroPayloadForFormat builds the Kiro API payload based on the source format.
 // This is critical because OpenAI and Claude formats have different tool structures:
 // - OpenAI: tools[].function.name, tools[].function.description
@@ -703,6 +728,9 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	// would otherwise attribute a purely client-side name error to this account.
 	kiroModelID, err := e.mapModelToKiro(req.Model)
 	if err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+	if err = checkKiroSourceFormat(opts.SourceFormat); err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
 
@@ -1186,6 +1214,9 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	if err != nil {
 		return nil, err
 	}
+	if err = checkKiroSourceFormat(opts.SourceFormat); err != nil {
+		return nil, err
+	}
 
 	if req.Payload, err = applyKiroThinking(req.Payload, req.Model, opts.SourceFormat.String()); err != nil {
 		return nil, err
@@ -1547,7 +1578,7 @@ func (e *KiroExecutor) executeStreamWithRetry(ctx context.Context, auth *cliprox
 				// So we always enable thinking parsing for Kiro responses
 				log.Debugf("kiro: stream thinkingEnabled = %v (always true for Kiro)", thinkingEnabled)
 
-				e.streamToChannel(ctx, resp.Body, out, from, payloadRequestedModel(opts, req.Model), opts.OriginalRequest, body, reporter, thinkingEnabled)
+				e.streamToChannel(ctx, resp.Body, out, from, payloadRequestedModel(opts, req.Model), req.Model, opts.OriginalRequest, body, reporter, thinkingEnabled)
 			}(httpResp, thinkingEnabled)
 
 			return out, nil
@@ -1896,7 +1927,10 @@ var kiroModelIDs = map[string]string{
 	// Backend-side router.
 	"auto": "auto",
 
-	// Anthropic — current generation.
+	// Anthropic — current generation. claude-opus-5.5 was verified against
+	// ListAvailableModels on 2026-09-27; unlike claude-opus-5 its backend id is
+	// dotted, so the dashed key is what every client spelling folds onto.
+	"claude-opus-5-5": "claude-opus-5.5",
 	"claude-opus-5":   "claude-opus-5",
 	"claude-sonnet-5": "claude-sonnet-5",
 
@@ -1979,6 +2013,27 @@ func (e *KiroExecutor) mapModelToKiro(model string) (string, error) {
 	}
 }
 
+// kiroContextWindowForModel returns the context window, in tokens, that Kiro's
+// contextUsagePercentage is measured against for the given model.
+//
+// It is each model's own maxInputTokens, not a fixed 200K. Measured 2026-09-27 by
+// adding the same ~95K-character prose block to a minimal request: the reported
+// percentage rose by 10.17 points on claude-haiku-4.5 and claude-sonnet-4.5
+// (200K windows) but by 2.034 on claude-sonnet-4.6 (1M), which shares their
+// tokenizer -- 20,341 tokens either way, but only when each is divided by its own
+// window. The former fixed 200K base therefore reported a fifth of the real input
+// for every 1M-context model, which is every current Claude model on Kiro.
+//
+// The catalogue entry is where that window is recorded; a model it does not
+// describe keeps the old 200K assumption.
+func kiroContextWindowForModel(model string) int64 {
+	name := thinking.ParseSuffix(strings.TrimSpace(model)).ModelName
+	if info := registry.LookupKiroModelInfo(name); info != nil && info.ContextLength > 0 {
+		return int64(info.ContextLength)
+	}
+	return registry.DefaultKiroContextLength
+}
+
 // kiroCreditUSDForModel returns the empirical USD-equivalence of one Kiro
 // credit when reconciled against the model's Anthropic MSRP price table.
 // Calibrated per-model because Kiro's published task-level multipliers
@@ -2021,6 +2076,18 @@ type kiroTokenPrice struct {
 func kiroTokenPriceForModel(model string) kiroTokenPrice {
 	modelLower := strings.ToLower(model)
 	switch {
+	case strings.Contains(strings.ReplaceAll(modelLower, ".", "-"), "opus-5-5"):
+		// Opus 5.5 is cheaper than the rest of the Opus line, and its cache reads
+		// are 0.05x input rather than 0.1x. These match sub2api's claude-opus-5-5
+		// entry, which is what bills the counts this estimator forwards, so any
+		// drift here turns straight into a mis-billed cache split.
+		return kiroTokenPrice{
+			inputPerMTok:        4.0,
+			outputPerMTok:       20.0,
+			cacheWritePerMTok:   5.0, // 5-min
+			cacheWrite1HPerMTok: 8.0, // 1-hour
+			cacheReadPerMTok:    0.20,
+		}
 	case strings.Contains(modelLower, "haiku"):
 		return kiroTokenPrice{
 			inputPerMTok:        1.0,
@@ -2930,11 +2997,11 @@ func (e *KiroExecutor) parseEventStream(body io.Reader, model string) (kiroNonSt
 		log.Warnf("kiro: response truncated due to max_tokens limit")
 	}
 
-	// Use contextUsagePercentage to calculate more accurate input tokens
-	// Kiro model has 200k max context, contextUsagePercentage represents the percentage used
-	// Formula: input_tokens = contextUsagePercentage * 200000 / 100
+	// Use contextUsagePercentage to calculate more accurate input tokens.
+	// The percentage is of the model's own context window; see
+	// kiroContextWindowForModel.
 	if upstreamContextPercentage > 0 && !hasOfficialTokenUsage {
-		calculatedInputTokens := int64(upstreamContextPercentage * 200000 / 100)
+		calculatedInputTokens := int64(upstreamContextPercentage * float64(kiroContextWindowForModel(model)) / 100)
 		if calculatedInputTokens > 0 {
 			localEstimate := usageInfo.InputTokens
 			usageInfo.InputTokens = calculatedInputTokens
@@ -3171,7 +3238,13 @@ func (e *KiroExecutor) extractEventTypeFromBytes(headers []byte) string {
 // Implements duplicate content filtering using lastContentEvent detection (based on AIClient-2-API).
 // Extracts stop_reason from upstream events when available.
 // thinkingEnabled controls whether <thinking> tags are parsed - only parse when request enabled thinking.
-func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out chan<- cliproxyexecutor.StreamChunk, targetFormat sdktranslator.Format, model string, originalReq, claudeBody []byte, reporter *usageReporter, thinkingEnabled bool) {
+//
+// model is the name the client asked for and is what the translated events echo
+// back. usageModel is the name the conductor resolved it to, and is what usage
+// accounting must key on: a user alias such as "opus" says nothing about which
+// Opus answered, and pricing or sizing the context window from it silently picks
+// the wrong model.
+func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out chan<- cliproxyexecutor.StreamChunk, targetFormat sdktranslator.Format, model, usageModel string, originalReq, claudeBody []byte, reporter *usageReporter, thinkingEnabled bool) {
 	reader := bufio.NewReaderSize(body, 20*1024*1024) // 20MB buffer to match other providers
 	var totalUsage usage.Detail
 	var hasToolUses bool          // Track if any tool uses were emitted
@@ -4256,14 +4329,11 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 		}
 	}
 
-	// Use contextUsagePercentage to calculate more accurate input tokens
-	// Kiro model has 200k max context, contextUsagePercentage represents the percentage used
-	// Formula: input_tokens = contextUsagePercentage * 200000 / 100
-	// Note: The effective input context is ~170k (200k - 30k reserved for output)
+	// Use contextUsagePercentage to calculate more accurate input tokens.
+	// The percentage is of the model's own context window; see
+	// kiroContextWindowForModel.
 	if upstreamContextPercentage > 0 && !hasOfficialTokenUsage {
-		// Calculate input tokens from context percentage
-		// Using 200k as the base since that's what Kiro reports against
-		calculatedInputTokens := int64(upstreamContextPercentage * 200000 / 100)
+		calculatedInputTokens := int64(upstreamContextPercentage * float64(kiroContextWindowForModel(usageModel)) / 100)
 
 		// Only use calculated value if it's significantly different from local estimate
 		// This provides more accurate token counts based on upstream data
@@ -4288,7 +4358,7 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 	// never sends those fields.
 	_, _ = hasOfficialCacheRead, hasOfficialCacheWrite
 	if hasUncachedInputTokens || (totalUsage.InputTokens > 0 && upstreamCreditUsage > 0) {
-		totalUsage, estimatedCacheRead, estimatedCacheWrite = estimateKiroCacheUsage(model, totalUsage, upstreamCreditUsage, hasUncachedInputTokens)
+		totalUsage, estimatedCacheRead, estimatedCacheWrite = estimateKiroCacheUsage(usageModel, totalUsage, upstreamCreditUsage, hasUncachedInputTokens)
 	}
 
 	// Update TotalTokens when upstream did not provide an authoritative total.

@@ -237,3 +237,47 @@ func TestForwardResponsesStreamDropsIncompleteTrailingDataChunkOnFlush(t *testin
 		t.Fatalf("expected incomplete trailing data to be dropped on flush.\nGot: %q", got)
 	}
 }
+
+// Executors such as Kiro end a chat stream by closing it, without a [DONE]
+// marker. The bridge must still close the Responses stream with
+// response.completed -- carrying the usage from the trailing usage-only chunk --
+// or clients wait for an event that never comes.
+func TestForwardChatAsResponsesStreamCompletesWithoutDoneMarker(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		withDone bool
+	}{
+		{"closed without [DONE]", false},
+		{"upstream sent [DONE]", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, recorder, c, flusher := newResponsesStreamTestHandler(t)
+
+			data := make(chan []byte, 4)
+			errs := make(chan *interfaces.ErrorMessage)
+			data <- []byte(`{"choices":[{"delta":{"content":"KIWI","role":"assistant"},"finish_reason":null,"index":0}],"id":"chatcmpl-1","model":"m","object":"chat.completion.chunk"}`)
+			data <- []byte(`{"choices":[{"delta":{},"finish_reason":"stop","index":0}],"id":"chatcmpl-1","model":"m","object":"chat.completion.chunk"}`)
+			data <- []byte(`{"choices":[],"id":"chatcmpl-1","model":"m","object":"chat.completion.chunk","usage":{"completion_tokens":2,"prompt_tokens":10,"total_tokens":12}}`)
+			if tc.withDone {
+				data <- []byte("[DONE]")
+			}
+			close(data)
+			close(errs)
+
+			var param any
+			h.forwardChatAsResponsesStream(c, flusher, func(error) {}, data, errs, c.Request.Context(), "m", []byte(`{"model":"m","input":"hi"}`), &param)
+
+			body := recorder.Body.String()
+			if n := strings.Count(body, "event: response.completed"); n != 1 {
+				t.Fatalf("response.completed events = %d, want 1\nbody: %s", n, body)
+			}
+			for _, line := range strings.Split(body, "\n") {
+				if strings.HasPrefix(line, "data: ") && strings.Contains(line, `"response.completed"`) {
+					if got := gjson.Get(strings.TrimPrefix(line, "data: "), "response.usage.input_tokens").Int(); got != 10 {
+						t.Fatalf("response.usage.input_tokens = %d, want 10\nline: %s", got, line)
+					}
+				}
+			}
+		})
+	}
+}

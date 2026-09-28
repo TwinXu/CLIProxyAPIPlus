@@ -689,6 +689,12 @@ func (h *OpenAIResponsesAPIHandler) forwardChatAsResponsesStream(c *gin.Context,
 			_, _ = fmt.Fprintf(c.Writer, "\nevent: error\ndata: %s\n\n", string(body))
 		},
 		WriteDone: func() {
+			// The converter emits response.completed only on the chat stream's
+			// [DONE] marker, which not every executor sends -- the chat handler
+			// appends it for its own clients instead. A clean close is the end of
+			// the stream either way, so supply the marker; a stream that already
+			// carried one has completed and this emits nothing.
+			writeChatAsResponsesChunk(c, ctx, modelName, originalResponsesJSON, []byte("[DONE]"), param)
 			_, _ = c.Writer.Write([]byte("\n"))
 		},
 	})

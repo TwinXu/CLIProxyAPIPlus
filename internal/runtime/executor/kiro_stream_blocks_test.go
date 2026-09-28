@@ -59,7 +59,7 @@ func runKiroStream(t *testing.T, frames ...[]byte) string {
 	}()
 
 	e.streamToChannel(context.Background(), bytes.NewReader(bytes.Join(frames, nil)), out,
-		sdktranslator.FromString("claude"), "kiro-claude-opus-5", claudeBody, claudeBody, nil, true)
+		sdktranslator.FromString("claude"), "kiro-claude-opus-5", "kiro-claude-opus-5", claudeBody, claudeBody, nil, true)
 	close(out)
 	return <-done
 }

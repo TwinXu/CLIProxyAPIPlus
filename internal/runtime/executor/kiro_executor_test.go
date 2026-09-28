@@ -780,6 +780,16 @@ func TestKiroMapModelToKiroCurrentGeneration(t *testing.T) {
 	}{
 		{"claude-opus-5", "claude-opus-5"},
 		{"claude-sonnet-5", "claude-sonnet-5"},
+		// Opus 5.5 is dotted on the backend. Clients address it by the dashed
+		// catalogue id; the dotted form is the backend's own spelling, and any
+		// name that does reach this function must still fold onto it.
+		{"claude-opus-5-5", "claude-opus-5.5"},
+		{"claude-opus-5.5", "claude-opus-5.5"},
+		{"kiro-claude-opus-5-5", "claude-opus-5.5"},
+		{"amazonq-claude-opus-5-5", "claude-opus-5.5"},
+		{"KIRO-CLAUDE-OPUS-5-5-AGENTIC", "claude-opus-5.5"},
+		{"claude-opus-5-5-chat", "claude-opus-5.5"},
+		{"claude-opus-5-5(high)", "claude-opus-5.5"},
 		{"kiro-claude-opus-5", "claude-opus-5"},
 		{"amazonq-claude-opus-5", "claude-opus-5"},
 		{"claude-opus-5-agentic", "claude-opus-5"},
@@ -842,6 +852,35 @@ func TestKiroMapModelToKiroRejectsUnknown(t *testing.T) {
 			}
 			if got != "" {
 				t.Fatalf("mapModelToKiro(%q) returned %q alongside an error, want empty", model, got)
+			}
+		})
+	}
+}
+
+// Opus 5.5 is priced below the rest of the Opus line, and its forwarded cache
+// counts are billed downstream by sub2api at these rates. Each spelling that
+// reaches the estimator must pick them up, and the neighbouring Opus models must
+// not: "opus-5" and "opus-4-5" are both substrings a loose match could trip on.
+func TestKiroTokenPriceForModel_Opus55(t *testing.T) {
+	opus55 := kiroTokenPrice{inputPerMTok: 4.0, outputPerMTok: 20.0, cacheWritePerMTok: 5.0, cacheWrite1HPerMTok: 8.0, cacheReadPerMTok: 0.20}
+	opus := kiroTokenPrice{inputPerMTok: 5.0, outputPerMTok: 25.0, cacheWritePerMTok: 6.25, cacheWrite1HPerMTok: 10.0, cacheReadPerMTok: 0.50}
+	for _, tc := range []struct {
+		model string
+		want  kiroTokenPrice
+	}{
+		{"claude-opus-5-5", opus55},
+		{"claude-opus-5.5", opus55},
+		{"kiro-claude-opus-5-5", opus55},
+		{"KIRO-CLAUDE-OPUS-5-5-AGENTIC", opus55},
+		{"claude-opus-5-5(high)", opus55},
+		{"claude-opus-5", opus},
+		{"kiro-claude-opus-5-agentic", opus},
+		{"claude-opus-4-5", opus},
+		{"claude-opus-4.5", opus},
+	} {
+		t.Run(tc.model, func(t *testing.T) {
+			if got := kiroTokenPriceForModel(tc.model); got != tc.want {
+				t.Fatalf("kiroTokenPriceForModel(%q) = %+v, want %+v", tc.model, got, tc.want)
 			}
 		})
 	}
@@ -1189,6 +1228,7 @@ func TestStreamToChannel_KiroCacheUsagePreservesOfficialTokenUsage(t *testing.T)
 		out,
 		sdktranslator.FromString("claude"),
 		"claude-sonnet-4",
+		"claude-sonnet-4",
 		nil,
 		[]byte(`{"messages":[]}`),
 		nil,
@@ -1254,6 +1294,7 @@ func TestStreamToChannel_EstimatesCacheFromCreditsBranchB(t *testing.T) {
 		out,
 		sdktranslator.FromString("claude"),
 		"claude-sonnet-4.5",
+		"claude-sonnet-4.5",
 		nil,
 		[]byte(`{"messages":[]}`),
 		nil,
@@ -1308,6 +1349,7 @@ func TestStreamToChannel_IgnoresNonCreditMeteringEvents(t *testing.T) {
 		bytes.NewReader(stream.Bytes()),
 		out,
 		sdktranslator.FromString("claude"),
+		"claude-sonnet-4",
 		"claude-sonnet-4",
 		nil,
 		[]byte(`{"messages":[]}`),
@@ -1596,5 +1638,131 @@ func TestEndpointAliases(t *testing.T) {
 	// Verify no unexpected aliases
 	if len(endpointAliases) != len(expectedAliases) {
 		t.Errorf("unexpected number of aliases: got %d, want %d", len(endpointAliases), len(expectedAliases))
+	}
+}
+
+// Only Claude Messages and OpenAI Chat Completions translate to Kiro. Any other
+// format used to reach the Claude builder untranslated -- an OpenAI Responses
+// body lost its "input" and the backend was sent a placeholder instead -- so it
+// must be refused, as a client error the conductor will not retry on other auths.
+func TestCheckKiroSourceFormat(t *testing.T) {
+	for _, format := range []string{"", "claude", "openai", "kiro"} {
+		if err := checkKiroSourceFormat(sdktranslator.FromString(format)); err != nil {
+			t.Errorf("format %q rejected: %v", format, err)
+		}
+	}
+	for _, format := range []string{"openai-response", "gemini", "gemini-cli"} {
+		err := checkKiroSourceFormat(sdktranslator.FromString(format))
+		if err == nil {
+			t.Errorf("format %q accepted, want a 400", format)
+			continue
+		}
+		se, ok := err.(statusErr)
+		if !ok || se.StatusCode() != http.StatusBadRequest {
+			t.Errorf("format %q: got %#v, want statusErr 400", format, err)
+		}
+		// The conductor only stops retrying a 400 whose text carries this marker.
+		if !strings.Contains(err.Error(), "invalid_request_error") {
+			t.Errorf("format %q: error %q lacks invalid_request_error", format, err.Error())
+		}
+	}
+}
+
+// contextUsagePercentage is measured against each model's own context window.
+// These pin the window per model, including the spellings that reach usage
+// accounting: the resolved upstream name with a thinking suffix, and the
+// backend's dotted id.
+func TestKiroContextWindowForModel(t *testing.T) {
+	for _, tc := range []struct {
+		model string
+		want  int64
+	}{
+		{"kiro-claude-opus-5-5", 1000000},
+		{"claude-opus-5.5", 1000000},
+		{"kiro-claude-opus-5-5-agentic(high)", 1000000},
+		{"kiro-claude-opus-5", 1000000},
+		{"kiro-claude-sonnet-4-6", 1000000},
+		{"kiro-claude-sonnet-4-5", 200000},
+		{"claude-haiku-4.5", 200000},
+		// Unknown to the catalogue: keep the old assumption rather than guess.
+		{"kiro-brand-new-model", 200000},
+		{"opus", 200000},
+	} {
+		t.Run(tc.model, func(t *testing.T) {
+			if got := kiroContextWindowForModel(tc.model); got != tc.want {
+				t.Fatalf("kiroContextWindowForModel(%q) = %d, want %d", tc.model, got, tc.want)
+			}
+		})
+	}
+}
+
+// Measured on the live backend: the same prose block raised contextUsagePercentage
+// by 2.034 on sonnet-4.6 (1M) and 10.17 on sonnet-4.5 (200K) -- about 20,340
+// tokens both times. With the old fixed 200K base the 1M model read as a fifth of
+// that. (The fixtures use exactly representable percentages.)
+func TestParseEventStream_ContextPercentageUsesModelWindow(t *testing.T) {
+	for _, tc := range []struct {
+		model string
+		pct   string
+		want  int64
+	}{
+		{"kiro-claude-sonnet-4-6", "2.5", 25000},
+		{"kiro-claude-sonnet-4-5", "12.5", 25000},
+	} {
+		t.Run(tc.model, func(t *testing.T) {
+			var stream bytes.Buffer
+			writeKiroTestEvent(t, &stream, "assistantResponseEvent", []byte(`{"assistantResponseEvent":{"content":"OK"}}`))
+			writeKiroTestEvent(t, &stream, "contextUsageEvent", []byte(`{"contextUsageEvent":{"contextUsagePercentage":`+tc.pct+`}}`))
+			parsed, err := (&KiroExecutor{}).parseEventStream(bytes.NewReader(stream.Bytes()), tc.model)
+			if err != nil {
+				t.Fatalf("parseEventStream() error = %v", err)
+			}
+			if parsed.Usage.InputTokens != tc.want {
+				t.Fatalf("InputTokens = %d, want %d", parsed.Usage.InputTokens, tc.want)
+			}
+		})
+	}
+}
+
+// The streaming path echoes the client's requested name, which may be a user
+// alias that names no model at all. Usage accounting must key on the resolved
+// model instead: here the alias "opus" would size the window at the 200K
+// fallback and report a fifth of the real input.
+func TestStreamToChannel_UsageKeysOnResolvedModel(t *testing.T) {
+	var stream bytes.Buffer
+	writeKiroTestEvent(t, &stream, "assistantResponseEvent", []byte(`{"assistantResponseEvent":{"content":"OK"}}`))
+	writeKiroTestEvent(t, &stream, "contextUsageEvent", []byte(`{"contextUsageEvent":{"contextUsagePercentage":2.5}}`))
+
+	out := make(chan cliproxyexecutor.StreamChunk, 16)
+	executor := &KiroExecutor{}
+	executor.streamToChannel(
+		context.Background(),
+		bytes.NewReader(stream.Bytes()),
+		out,
+		sdktranslator.FromString("claude"),
+		"opus",
+		"kiro-claude-sonnet-4-6",
+		nil,
+		[]byte(`{"messages":[]}`),
+		nil,
+		false,
+	)
+	close(out)
+
+	var messageDelta string
+	for chunk := range out {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error = %v", chunk.Err)
+		}
+		payload := string(chunk.Payload)
+		if strings.HasPrefix(payload, "event: message_delta\ndata: ") {
+			messageDelta = strings.TrimSpace(strings.TrimPrefix(payload, "event: message_delta\ndata: "))
+		}
+	}
+	if messageDelta == "" {
+		t.Fatal("expected message_delta event")
+	}
+	if got := gjson.Get(messageDelta, "usage.input_tokens").Int(); got != 25000 {
+		t.Fatalf("usage.input_tokens = %d, want 25000 (window of the resolved 1M model)", got)
 	}
 }

@@ -136,10 +136,13 @@ func TestKiroClaudeModelsAllHaveAgenticVariants(t *testing.T) {
 
 // kiro-claude-opus-4-7 was added with the same 1M/128K/five-level shape as 4.8 but
 // no coverage; a typo in those numbers, or the entry going missing, shipped silently.
-func TestKiroStaticModelsIncludeOpus47(t *testing.T) {
+// Opus 5.5 reports the same shape on ListAvailableModels (probed 2026-09-27).
+func TestKiroStaticModelsIncludeLargeOutputOpus(t *testing.T) {
 	for _, tc := range []struct{ id, displayName string }{
 		{"kiro-claude-opus-4-7", "Kiro Claude Opus 4.7"},
 		{"kiro-claude-opus-4-7-agentic", "Kiro Claude Opus 4.7 (Agentic)"},
+		{"kiro-claude-opus-5-5", "Kiro Claude Opus 5.5"},
+		{"kiro-claude-opus-5-5-agentic", "Kiro Claude Opus 5.5 (Agentic)"},
 	} {
 		model := findModelInfo(GetKiroModels(), tc.id)
 		if model == nil {
@@ -160,13 +163,14 @@ func TestKiroStaticModelsIncludeOpus47(t *testing.T) {
 	}
 }
 
-// The Claude 5 pair uses effort levels, so their ThinkingSupport must carry Levels
+// The Claude 5 models use effort levels, so their ThinkingSupport must carry Levels
 // and no budget: a non-zero Min/Max would make detectModelCapability read them as
 // budget-capable and send a budget the backend does not accept.
 func TestKiroClaude5ModelsDeclareEffortLevelsNotBudgets(t *testing.T) {
 	for _, id := range []string{
 		"kiro-claude-opus-5", "kiro-claude-sonnet-5",
 		"kiro-claude-opus-5-agentic", "kiro-claude-sonnet-5-agentic",
+		"kiro-claude-opus-5-5", "kiro-claude-opus-5-5-agentic",
 	} {
 		model := findModelInfo(GetKiroModels(), id)
 		if model == nil {

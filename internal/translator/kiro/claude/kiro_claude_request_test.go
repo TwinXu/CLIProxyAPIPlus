@@ -1,6 +1,7 @@
 package claude
 
 import (
+	"net/http"
 	"strings"
 	"testing"
 
@@ -51,5 +52,66 @@ func TestBuildKiroPayloadAdaptiveEffortNoneDisables(t *testing.T) {
 	content := gjson.GetBytes(out, "conversationState.currentMessage.userInputMessage.content").String()
 	if strings.Contains(content, "<thinking_mode>enabled</thinking_mode>") {
 		t.Fatalf("effort=none must not inject thinking prompt, content=%s", content)
+	}
+}
+
+// max_tokens=-1 means "use the maximum", which is the model's own ceiling. A fixed
+// 32000 capped the Opus 4.7+/5/5.5 tier at a quarter of what it accepts. The
+// model ids here are backend spellings, as mapModelToKiro hands them over.
+func TestBuildKiroPayloadMaxTokensMinusOneUsesModelCeiling(t *testing.T) {
+	for _, tc := range []struct {
+		modelID string
+		want    int64
+	}{
+		{"claude-opus-5.5", 128000},
+		{"claude-opus-5", 128000},
+		{"claude-sonnet-4.6", 64000},
+		{"claude-haiku-4.5", 64000},
+		// Not in the catalogue: keep the old ceiling rather than guess.
+		{"brand-new-model", 32000},
+	} {
+		t.Run(tc.modelID, func(t *testing.T) {
+			body := []byte(`{"model":"x","max_tokens":-1,"messages":[{"role":"user","content":"hi"}]}`)
+			payload, _ := BuildKiroPayload(body, tc.modelID, "arn:test", "AI_EDITOR", false, false, nil, nil)
+			if got := gjson.GetBytes(payload, "inferenceConfig.maxTokens").Int(); got != tc.want {
+				t.Fatalf("inferenceConfig.maxTokens = %d, want %d\npayload: %s", got, tc.want, payload)
+			}
+		})
+	}
+}
+
+// Claude Code sends the interleaved-thinking beta header on every request,
+// including ones that switch thinking off. The body's explicit setting is the
+// request's own and must win; the header alone still enables thinking.
+func TestThinkingExplicitDisableOutranksBetaHeader(t *testing.T) {
+	headers := http.Header{}
+	headers.Set("Anthropic-Beta", "interleaved-thinking-2025-05-14")
+
+	for _, tc := range []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"thinking disabled", `{"thinking":{"type":"disabled"}}`, false},
+		{"zero budget", `{"thinking":{"type":"enabled","budget_tokens":0}}`, false},
+		{"reasoning_effort none", `{"reasoning_effort":"none"}`, false},
+		{"header alone", `{}`, true},
+		{"adaptive", `{"thinking":{"type":"adaptive"}}`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsThinkingEnabledWithHeaders([]byte(tc.body), headers); got != tc.want {
+				t.Fatalf("IsThinkingEnabledWithHeaders(%s) = %t, want %t", tc.body, got, tc.want)
+			}
+		})
+	}
+
+	// End to end: a disabled request must not carry adaptive thinking to the backend.
+	body := []byte(`{"model":"x","max_tokens":1024,"thinking":{"type":"disabled"},"messages":[{"role":"user","content":"hi"}]}`)
+	payload, enabled := BuildKiroPayload(body, "claude-opus-5", "arn:test", "AI_EDITOR", false, false, headers, nil)
+	if enabled {
+		t.Fatal("thinking reported enabled despite thinking.type=disabled")
+	}
+	if gjson.GetBytes(payload, "additionalModelRequestFields").Exists() {
+		t.Fatalf("additionalModelRequestFields must be absent\npayload: %s", payload)
 	}
 }

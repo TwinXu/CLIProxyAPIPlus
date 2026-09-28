@@ -741,6 +741,18 @@ func GetKiroModels() []*ModelInfo {
 			Thinking:            &ThinkingSupport{Min: 1024, Max: 32000, ZeroAllowed: true, DynamicAllowed: true},
 		},
 		{
+			ID:                  "kiro-claude-opus-5-5",
+			Object:              "model",
+			Created:             1790035200, // 2026-09-22
+			OwnedBy:             "aws",
+			Type:                "kiro",
+			DisplayName:         "Kiro Claude Opus 5.5",
+			Description:         "Claude Opus 5.5 via Kiro (2.0x credit)",
+			ContextLength:       KiroModernContextLength,
+			MaxCompletionTokens: KiroModernMaxOutputLarge,
+			Thinking:            KiroThinkingWithXHigh(),
+		},
+		{
 			ID:                  "kiro-claude-opus-5",
 			Object:              "model",
 			Created:             1786060800, // 2026-08-07
@@ -943,6 +955,18 @@ func GetKiroModels() []*ModelInfo {
 		// means a model that still executes -- canonicalKiroModelName strips
 		// -agentic before routing -- while being advertised nowhere and described
 		// by nothing, so applyKiroThinking cannot resolve its capabilities either.
+		{
+			ID:                  "kiro-claude-opus-5-5-agentic",
+			Object:              "model",
+			Created:             1790035200, // 2026-09-22
+			OwnedBy:             "aws",
+			Type:                "kiro",
+			DisplayName:         "Kiro Claude Opus 5.5 (Agentic)",
+			Description:         "Claude Opus 5.5 optimized for coding agents (chunked writes)",
+			ContextLength:       KiroModernContextLength,
+			MaxCompletionTokens: KiroModernMaxOutputLarge,
+			Thinking:            KiroThinkingWithXHigh(),
+		},
 		{
 			ID:                  "kiro-claude-opus-5-agentic",
 			Object:              "model",
