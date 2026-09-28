@@ -258,7 +258,10 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		return
 	}
 	auths := h.authManager.List()
-	counts := usage.GetRequestStatistics().AuthIndexCountsSnapshot()
+	counts := map[string]usage.AuthIndexCounts{}
+	if h.usageStats != nil {
+		counts = h.usageStats.AuthIndexCountsSnapshot()
+	}
 	files := make([]gin.H, 0, len(auths))
 	for _, auth := range auths {
 		if entry := h.buildAuthFileEntry(auth, counts); entry != nil {
@@ -271,6 +274,12 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		return strings.ToLower(nameI) < strings.ToLower(nameJ)
 	})
 	c.JSON(200, gin.H{"files": files})
+}
+
+type authFileRecentRequest struct {
+	Time    string `json:"time"`
+	Success int64  `json:"success"`
+	Failed  int64  `json:"failed"`
 }
 
 // GetAuthFileModels returns the models supported by a specific auth file
@@ -339,10 +348,13 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 		}
 		if info, errInfo := e.Info(); errInfo == nil {
 			fileData := gin.H{
-				"name":    name,
-				"size":    info.Size(),
-				"modtime": info.ModTime(),
-				"stats":   gin.H{"success": int64(0), "failure": int64(0)},
+				"name":            name,
+				"size":            info.Size(),
+				"modtime":         info.ModTime(),
+				"success":         int64(0),
+				"failed":          int64(0),
+				"recent_requests": []authFileRecentRequest{},
+				"stats":           gin.H{"success": int64(0), "failure": int64(0)},
 			}
 
 			// Read file to get type field
@@ -393,24 +405,38 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth, counts map[string]usag
 		name = auth.ID
 	}
 	entry := gin.H{
-		"id":             auth.ID,
-		"auth_index":     auth.Index,
-		"name":           name,
-		"type":           strings.TrimSpace(auth.Provider),
-		"provider":       strings.TrimSpace(auth.Provider),
-		"label":          auth.Label,
-		"status":         auth.Status,
-		"status_message": auth.StatusMessage,
-		"disabled":       auth.Disabled,
-		"unavailable":    auth.Unavailable,
-		"runtime_only":   runtimeOnly,
-		"source":         "memory",
-		"size":           int64(0),
-		"stats":          gin.H{"success": int64(0), "failure": int64(0)},
+		"id":              auth.ID,
+		"auth_index":      auth.Index,
+		"name":            name,
+		"type":            strings.TrimSpace(auth.Provider),
+		"provider":        strings.TrimSpace(auth.Provider),
+		"label":           auth.Label,
+		"status":          auth.Status,
+		"status_message":  auth.StatusMessage,
+		"disabled":        auth.Disabled,
+		"unavailable":     auth.Unavailable,
+		"runtime_only":    runtimeOnly,
+		"source":          "memory",
+		"size":            int64(0),
+		"success":         int64(0),
+		"failed":          int64(0),
+		"recent_requests": []authFileRecentRequest{},
+		"stats":           gin.H{"success": int64(0), "failure": int64(0)},
 	}
 	if counts != nil {
 		if c, ok := counts[auth.Index]; ok {
+			entry["success"] = c.Success
+			entry["failed"] = c.Failure
 			entry["stats"] = gin.H{"success": c.Success, "failure": c.Failure}
+			recentRequests := make([]authFileRecentRequest, len(c.RecentRequests))
+			for i, window := range c.RecentRequests {
+				recentRequests[i] = authFileRecentRequest{
+					Time:    window.Time.UTC().Format(time.RFC3339),
+					Success: window.Success,
+					Failed:  window.Failed,
+				}
+			}
+			entry["recent_requests"] = recentRequests
 		}
 	}
 	if email := authEmail(auth); email != "" {

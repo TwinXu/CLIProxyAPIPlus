@@ -14,12 +14,14 @@ const kiroCreditScript = `<script data-cpa-auth-card-script>
   const ENC_PREFIX = "enc::v1::";
   const STORE_KEY = "cli-proxy-api-webui::secure-storage";
   const CLASS_PREFIX = {
-    card: ["AuthFilesPage-module__fileCard___", "AuthFilesPage_fileCard__", "fileCard___", "fileCard__"],
-    type: ["AuthFilesPage-module__typeBadge___", "AuthFilesPage_typeBadge__", "typeBadge___", "typeBadge__"],
-    name: ["AuthFilesPage-module__fileName___", "AuthFilesPage_fileName__", "fileName___", "fileName__"],
-    meta: ["AuthFilesPage-module__cardMeta___", "AuthFilesPage_cardMeta__", "cardMeta___", "cardMeta__"],
+    card: ["AuthFileCard-module__card___", "AuthFilesPage-module__fileCard___", "AuthFilesPage_fileCard__", "fileCard___", "fileCard__"],
+    type: ["AuthFileCard-module__typeBadge___", "AuthFilesPage-module__typeBadge___", "AuthFilesPage_typeBadge__", "typeBadge___", "typeBadge__"],
+    name: ["AuthFileCard-module__fileName___", "AuthFilesPage-module__fileName___", "AuthFilesPage_fileName__", "fileName___", "fileName__"],
+    account: ["AuthFileCard-module__account___"],
+    meta: ["AuthFileCard-module__metaRow___", "AuthFilesPage-module__cardMeta___", "AuthFilesPage_cardMeta__", "cardMeta___", "cardMeta__"],
     item: ["AuthFilesPage-module__metaItem___", "AuthFilesPage_metaItem__", "metaItem___", "metaItem__"],
-    label: ["AuthFilesPage-module__metaLabel___", "AuthFilesPage_metaLabel__", "metaLabel___", "metaLabel__"],
+    divider: ["AuthFileCard-module__metaDivider___"],
+    label: ["AuthFileCard-module__metaMetricLabel___", "AuthFilesPage-module__metaLabel___", "AuthFilesPage_metaLabel__", "metaLabel___", "metaLabel__"],
     value: ["AuthFilesPage-module__metaValue___", "AuthFilesPage_metaValue__", "metaValue___", "metaValue__"]
   };
   const quotaState = new Map();
@@ -198,18 +200,61 @@ const kiroCreditScript = `<script data-cpa-auth-card-script>
     return Number.isInteger(n) ? String(n) : n.toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
   }
 
+  function normalizedFileName(value) {
+    return String(value || "").trim().toLowerCase().replace(/\.json$/, "");
+  }
+
+  function cardFileNames(card) {
+    const names = [];
+    for (const key of ["name", "account"]) {
+      const element = queryByClassPrefix(card, key);
+      if (!element) continue;
+      const title = element.getAttribute("title");
+      const text = element.textContent;
+      if (title && title.trim()) names.push(title.trim());
+      if (text && text.trim()) names.push(text.trim());
+    }
+    return Array.from(new Set(names));
+  }
+
+  function findAuthFileForCard(card, files) {
+    const names = cardFileNames(card);
+    if (names.length === 0) return null;
+    return files.find(file => {
+      if (!file) return false;
+      const fileNames = [file.name, file.id].filter(Boolean);
+      return names.some(name => fileNames.some(fileName =>
+        name === fileName || normalizedFileName(name) === normalizedFileName(fileName)
+      ));
+    }) || null;
+  }
+
   function upsertCredit(card, text, title, opts) {
     const meta = queryByClassPrefix(card, "meta");
     if (!meta) return;
     let item = meta.querySelector("[data-kiro-credit]");
     if (!item) {
-      item = document.createElement("div");
-      item.className = classNameWithPrefix(document, "item");
-      item.dataset.kiroCredit = "true";
       const labelClass = classNameWithPrefix(document, "label");
       const valueClass = classNameWithPrefix(document, "value");
-      const btnStyle = "background:transparent;border:none;cursor:pointer;padding:0 4px;font-size:14px;line-height:1;color:inherit;opacity:0.7;margin-left:4px;";
-      item.innerHTML = '<span class="' + labelClass + '">Credit Used</span><span class="' + valueClass + '" data-kiro-credit-value></span><button type="button" data-kiro-refresh title="刷新" style="' + btnStyle + '">↻</button>';
+      const itemClass = classNameWithPrefix(document, "item");
+      const dividerClass = classNameWithPrefix(document, "divider");
+      const btnStyle = "background:transparent;border:none;cursor:pointer;padding:0 4px;font-size:inherit;line-height:1;color:inherit;opacity:0.7;";
+      if (itemClass) {
+        // Legacy AuthFilesPage cards contain metaItem blocks with label and value spans.
+        item = document.createElement("div");
+        item.className = itemClass;
+        item.dataset.kiroCredit = "true";
+        item.innerHTML = '<span class="' + labelClass + '">Credit Used</span><span class="' + valueClass + '" data-kiro-credit-value></span><button type="button" data-kiro-refresh title="刷新" style="' + btnStyle + 'margin-left:4px;">↻</button>';
+      } else {
+        // Modern AuthFileCard cards render metrics in a flex row separated by dots.
+        item = document.createElement("span");
+        item.dataset.kiroCredit = "true";
+        item.style.display = "inline-flex";
+        item.style.alignItems = "center";
+        item.style.gap = "4px";
+        const divider = dividerClass ? '<span class="' + dividerClass + '" aria-hidden="true">·</span>' : "";
+        item.innerHTML = divider + '<span class="' + labelClass + '">Credit Used</span><span data-kiro-credit-value></span><button type="button" data-kiro-refresh title="刷新" style="' + btnStyle + '">↻</button>';
+      }
       meta.appendChild(item);
     }
     const btn = item.querySelector("[data-kiro-refresh]");
@@ -246,18 +291,19 @@ const kiroCreditScript = `<script data-cpa-auth-card-script>
   async function hydrateKiroCredits() {
     if (!location.hash.includes("/auth-files")) return;
     const cards = elementsByClassPrefix("card");
-    const kiroCards = cards.filter(card => queryByClassPrefix(card, "type")?.textContent?.trim().toLowerCase() === "kiro");
-    if (kiroCards.length === 0) return;
+    if (cards.length === 0) return;
     let files;
     try {
       files = await getAuthFiles();
     } catch {
       return;
     }
-    for (const card of kiroCards) {
-      const name = queryByClassPrefix(card, "name")?.textContent?.trim();
+    for (const card of cards) {
+      const file = findAuthFileForCard(card, files);
+      const provider = String(file?.type || file?.provider || queryByClassPrefix(card, "type")?.textContent || "").trim().toLowerCase();
+      if (!file || provider !== "kiro") continue;
+      const name = String(file.name || file.id || "").trim();
       if (!name) continue;
-      const file = files.find(f => f && (f.name === name || f.id === name));
       const authIndex = file?.auth_index || file?.authIndex;
       if (!authIndex) continue;
       const cached = quotaState.get(name);
