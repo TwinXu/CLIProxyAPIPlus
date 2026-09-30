@@ -79,6 +79,7 @@ func TestSanitizeOAuthModelAlias_InjectsDefaultKiroAliases(t *testing.T) {
 	}
 	expectedAliases := []string{
 		"claude-opus-5-5",
+		"claude-sonnet-5-5",
 		"claude-opus-5",
 		"claude-sonnet-5",
 		"claude-sonnet-4-5-20250929",

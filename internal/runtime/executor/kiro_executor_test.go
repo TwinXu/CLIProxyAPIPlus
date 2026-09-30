@@ -790,6 +790,15 @@ func TestKiroMapModelToKiroCurrentGeneration(t *testing.T) {
 		{"KIRO-CLAUDE-OPUS-5-5-AGENTIC", "claude-opus-5.5"},
 		{"claude-opus-5-5-chat", "claude-opus-5.5"},
 		{"claude-opus-5-5(high)", "claude-opus-5.5"},
+		// Sonnet 5.5 is assumed to follow the same spelling; the backend did
+		// not serve it yet when this was added.
+		{"claude-sonnet-5-5", "claude-sonnet-5.5"},
+		{"claude-sonnet-5.5", "claude-sonnet-5.5"},
+		{"kiro-claude-sonnet-5-5", "claude-sonnet-5.5"},
+		{"amazonq-claude-sonnet-5-5", "claude-sonnet-5.5"},
+		{"KIRO-CLAUDE-SONNET-5-5-AGENTIC", "claude-sonnet-5.5"},
+		{"claude-sonnet-5-5-chat", "claude-sonnet-5.5"},
+		{"claude-sonnet-5-5(high)", "claude-sonnet-5.5"},
 		{"kiro-claude-opus-5", "claude-opus-5"},
 		{"amazonq-claude-opus-5", "claude-opus-5"},
 		{"claude-opus-5-agentic", "claude-opus-5"},
@@ -857,13 +866,16 @@ func TestKiroMapModelToKiroRejectsUnknown(t *testing.T) {
 	}
 }
 
-// Opus 5.5 is priced below the rest of the Opus line, and its forwarded cache
-// counts are billed downstream by sub2api at these rates. Each spelling that
-// reaches the estimator must pick them up, and the neighbouring Opus models must
-// not: "opus-5" and "opus-4-5" are both substrings a loose match could trip on.
-func TestKiroTokenPriceForModel_Opus55(t *testing.T) {
+// Opus 5.5 and Sonnet 5.5 are priced below the rest of their lines, and their
+// forwarded cache counts are billed downstream by sub2api at these rates. Each
+// spelling that reaches the estimator must pick them up, and the neighbouring
+// models must not: "opus-5", "opus-4-5" and "sonnet-4-5" are all substrings a
+// loose match could trip on.
+func TestKiroTokenPriceForModel_Claude55(t *testing.T) {
 	opus55 := kiroTokenPrice{inputPerMTok: 4.0, outputPerMTok: 20.0, cacheWritePerMTok: 5.0, cacheWrite1HPerMTok: 8.0, cacheReadPerMTok: 0.20}
 	opus := kiroTokenPrice{inputPerMTok: 5.0, outputPerMTok: 25.0, cacheWritePerMTok: 6.25, cacheWrite1HPerMTok: 10.0, cacheReadPerMTok: 0.50}
+	sonnet55 := kiroTokenPrice{inputPerMTok: 2.0, outputPerMTok: 10.0, cacheWritePerMTok: 2.5, cacheWrite1HPerMTok: 4.0, cacheReadPerMTok: 0.20}
+	sonnet := kiroTokenPrice{inputPerMTok: 3.0, outputPerMTok: 15.0, cacheWritePerMTok: 3.75, cacheWrite1HPerMTok: 6.0, cacheReadPerMTok: 0.30}
 	for _, tc := range []struct {
 		model string
 		want  kiroTokenPrice
@@ -877,6 +889,15 @@ func TestKiroTokenPriceForModel_Opus55(t *testing.T) {
 		{"kiro-claude-opus-5-agentic", opus},
 		{"claude-opus-4-5", opus},
 		{"claude-opus-4.5", opus},
+		{"claude-sonnet-5-5", sonnet55},
+		{"claude-sonnet-5.5", sonnet55},
+		{"kiro-claude-sonnet-5-5", sonnet55},
+		{"KIRO-CLAUDE-SONNET-5-5-AGENTIC", sonnet55},
+		{"claude-sonnet-5-5(high)", sonnet55},
+		{"claude-sonnet-5", sonnet},
+		{"kiro-claude-sonnet-5-agentic", sonnet},
+		{"claude-sonnet-4-5", sonnet},
+		{"claude-sonnet-4.5", sonnet},
 	} {
 		t.Run(tc.model, func(t *testing.T) {
 			if got := kiroTokenPriceForModel(tc.model); got != tc.want {
@@ -1681,6 +1702,10 @@ func TestKiroContextWindowForModel(t *testing.T) {
 		{"claude-opus-5.5", 1000000},
 		{"kiro-claude-opus-5-5-agentic(high)", 1000000},
 		{"kiro-claude-opus-5", 1000000},
+		// Nothing registers sonnet-5-5 here, which is also what the executor
+		// sees under force-model-prefix: the window must still be 1M.
+		{"kiro-claude-sonnet-5-5", 1000000},
+		{"claude-sonnet-5.5", 1000000},
 		{"kiro-claude-sonnet-4-6", 1000000},
 		{"kiro-claude-sonnet-4-5", 200000},
 		{"claude-haiku-4.5", 200000},

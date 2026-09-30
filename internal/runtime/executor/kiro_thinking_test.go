@@ -61,6 +61,8 @@ func TestKiroEffortReachesTheBackend(t *testing.T) {
 	for _, tc := range []struct{ model, backendID string }{
 		{"kiro-claude-opus-5", "claude-opus-5"},
 		{"kiro-claude-opus-5-5", "claude-opus-5.5"},
+		// Unregistered here, as it is under force-model-prefix.
+		{"kiro-claude-sonnet-5-5", "claude-sonnet-5.5"},
 	} {
 		t.Run(tc.model, func(t *testing.T) {
 			body := `{"model":"` + tc.model + `","max_tokens":1024,"messages":[{"role":"user","content":"hi"}]}`
