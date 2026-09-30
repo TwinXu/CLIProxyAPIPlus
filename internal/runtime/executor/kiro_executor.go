@@ -1933,6 +1933,13 @@ var kiroModelIDs = map[string]string{
 	"claude-opus-5-5": "claude-opus-5.5",
 	"claude-opus-5":   "claude-opus-5",
 	"claude-sonnet-5": "claude-sonnet-5",
+	// The one exception to the rule above: on 2026-09-30 the backend neither
+	// listed claude-sonnet-5.5 nor accepted it (INVALID_MODEL_ID on all three
+	// endpoints). Nothing advertises it until ListAvailableModels lists it, and
+	// it is here so that model is served on the day it appears. Until then a
+	// hand-written alias targeting it gets the backend's 400 rather than this
+	// function's. The value assumes opus-5.5's dotted form.
+	"claude-sonnet-5-5": "claude-sonnet-5.5",
 
 	// Anthropic — previous generations.
 	"claude-opus-4-8":   "claude-opus-4.8",
@@ -2045,6 +2052,10 @@ func kiroContextWindowForModel(model string) int64 {
 //	sonnet : 0.135  (10 sample rows, range 0.12-0.14)
 //	haiku  : 0.37   (4  sample rows, range 0.30-0.40)
 //	opus   : 0.08
+//
+// These are MSRP dollars per credit, not what a credit costs (Kiro sells them
+// at $0.02). The fit predates Opus 5.5 and Sonnet 5.5; with their lower MSRP,
+// the family values they inherit may overstate them.
 func kiroCreditUSDForModel(model string) float64 {
 	modelLower := strings.ToLower(model)
 	switch {
@@ -2086,6 +2097,16 @@ func kiroTokenPriceForModel(model string) kiroTokenPrice {
 			outputPerMTok:       20.0,
 			cacheWritePerMTok:   5.0, // 5-min
 			cacheWrite1HPerMTok: 8.0, // 1-hour
+			cacheReadPerMTok:    0.20,
+		}
+	case strings.Contains(strings.ReplaceAll(modelLower, ".", "-"), "sonnet-5-5"):
+		// Sonnet 5.5 is a third below the rest of the Sonnet line; sub2api's
+		// claude-sonnet-5-5 entry, for the same reason as Opus 5.5 above.
+		return kiroTokenPrice{
+			inputPerMTok:        2.0,
+			outputPerMTok:       10.0,
+			cacheWritePerMTok:   2.5, // 5-min
+			cacheWrite1HPerMTok: 4.0, // 1-hour
 			cacheReadPerMTok:    0.20,
 		}
 	case strings.Contains(modelLower, "haiku"):

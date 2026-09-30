@@ -65,6 +65,9 @@ func TestBuildKiroPayloadMaxTokensMinusOneUsesModelCeiling(t *testing.T) {
 	}{
 		{"claude-opus-5.5", 128000},
 		{"claude-opus-5", 128000},
+		// Not yet served: from the entry kept for lookups that miss the
+		// backend's registration.
+		{"claude-sonnet-5.5", 64000},
 		{"claude-sonnet-4.6", 64000},
 		{"claude-haiku-4.5", 64000},
 		// Not in the catalogue: keep the old ceiling rather than guess.

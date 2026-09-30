@@ -342,6 +342,7 @@ func LookupStaticModelInfo(modelID string) *ModelInfo {
 		data.Antigravity,
 		GetGitHubCopilotModels(),
 		GetKiroModels(),
+		kiroModelsAwaitingBackend(),
 		GetKiloModels(),
 		GetAmazonQModels(),
 		GetCodeBuddyModels(),
@@ -1122,6 +1123,32 @@ func GetKiroModels() []*ModelInfo {
 			ContextLength:       128000,
 			MaxCompletionTokens: 32768,
 			Thinking:            &ThinkingSupport{Min: 1024, Max: 32000, ZeroAllowed: true, DynamicAllowed: true},
+		},
+	}
+}
+
+// kiroModelsAwaitingBackend describes Kiro models routed ahead of the backend
+// serving them. LookupStaticModelInfo finds them, but GetKiroModels -- what the
+// static fallback advertises -- leaves them out, so they appear only once
+// ListAvailableModels lists them. The backend's own numbers are registered then
+// and win; these answer the lookups that miss that registration because
+// force-model-prefix or a non-forking alias registered it under another id, and
+// that would otherwise fall to the 200K/32K defaults with no thinking.
+func kiroModelsAwaitingBackend() []*ModelInfo {
+	return []*ModelInfo{
+		{
+			// Not served on 2026-09-30. The window is every current Kiro Claude
+			// model's; the output ceiling and effort levels are claude-sonnet-5's.
+			ID:                  "kiro-claude-sonnet-5-5",
+			Object:              "model",
+			Created:             1790640000, // 2026-09-29
+			OwnedBy:             "aws",
+			Type:                "kiro",
+			DisplayName:         "Kiro Claude Sonnet 5.5",
+			Description:         "Claude Sonnet 5.5 via Kiro",
+			ContextLength:       KiroModernContextLength,
+			MaxCompletionTokens: KiroModernMaxOutputStandard,
+			Thinking:            KiroThinkingWithXHigh(),
 		},
 	}
 }

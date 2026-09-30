@@ -12,6 +12,7 @@ func TestLookupKiroModelInfoFoldsBackendSpelling(t *testing.T) {
 		"kiro-claude-opus-4-8", "KIRO-CLAUDE-OPUS-4-8",
 		"claude-opus-5", "kiro-claude-opus-5-agentic", "amazonq-claude-opus-4-8",
 		"claude-opus-5.5", "kiro-claude-opus-5-5-agentic",
+		"claude-sonnet-5.5", "amazonq-claude-sonnet-5-5", "kiro-claude-sonnet-5-5-agentic",
 	} {
 		t.Run(name, func(t *testing.T) {
 			info := LookupKiroModelInfo(name)
@@ -52,6 +53,27 @@ func TestLookupKiroModelInfoRejectsEmpty(t *testing.T) {
 	for _, name := range []string{"", "   ", "kiro-", "amazonq-", "-agentic"} {
 		if info := LookupKiroModelInfo(name); info != nil {
 			t.Errorf("LookupKiroModelInfo(%q) = %q, want nil", name, info.ID)
+		}
+	}
+}
+
+// A model awaiting the backend must be described but not advertised. Lookups
+// that miss the backend's registration -- the executor's, and ApplyThinking's
+// by the resolved id -- must find its capabilities rather than the 200K/32K
+// defaults, while the lists served as the static fallback must leave it out.
+func TestKiroModelsAwaitingBackendAreDescribedNotAdvertised(t *testing.T) {
+	for _, m := range kiroModelsAwaitingBackend() {
+		for _, list := range [][]*ModelInfo{GetKiroModels(), GetStaticModelDefinitionsByChannel("kiro")} {
+			for _, advertised := range list {
+				if advertised.ID == m.ID {
+					t.Errorf("%s is advertised before the backend serves it", m.ID)
+				}
+			}
+		}
+		for _, info := range []*ModelInfo{LookupKiroModelInfo(m.ID), LookupModelInfo(m.ID, "kiro")} {
+			if info == nil || info.ID != m.ID || info.ContextLength != KiroModernContextLength || info.Thinking == nil {
+				t.Errorf("lookup of %s = %+v, want its own entry with a 1M window and thinking", m.ID, info)
+			}
 		}
 	}
 }
