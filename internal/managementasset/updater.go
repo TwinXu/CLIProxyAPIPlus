@@ -25,8 +25,13 @@ import (
 )
 
 const (
-	defaultManagementReleaseURL  = "https://api.github.com/repos/router-for-me/Cli-Proxy-API-Management-Center/releases/latest"
-	defaultManagementFallbackURL = "https://cpamc.router-for.me/"
+	// defaultManagementRepo releases from v1.25.0 on only speak the /v8/management API,
+	// which this fork does not serve, so the upstream panel is pinned to the last
+	// release that still uses /v0/management.
+	defaultManagementRepo        = "router-for-me/Cli-Proxy-API-Management-Center"
+	managementPanelPinnedTag     = "v1.24.2"
+	defaultManagementReleaseURL  = "https://api.github.com/repos/" + defaultManagementRepo + "/releases/tags/" + managementPanelPinnedTag
+	defaultManagementFallbackURL = "https://github.com/" + defaultManagementRepo + "/releases/download/" + managementPanelPinnedTag + "/" + managementAssetName
 	managementAssetName          = "management.html"
 	httpUserAgent                = "CLIProxyAPI-management-updater"
 	managementSyncMinInterval    = 30 * time.Second
@@ -318,6 +323,9 @@ func resolveReleaseURL(repo string) string {
 		if !strings.HasSuffix(strings.ToLower(parsed.Path), "/releases/latest") {
 			parsed.Path = parsed.Path + "/releases/latest"
 		}
+		if strings.EqualFold(parsed.Path, "/repos/"+defaultManagementRepo+"/releases/latest") {
+			return defaultManagementReleaseURL
+		}
 		return parsed.String()
 	}
 
@@ -325,6 +333,9 @@ func resolveReleaseURL(repo string) string {
 		parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
 		if len(parts) >= 2 && parts[0] != "" && parts[1] != "" {
 			repoName := strings.TrimSuffix(parts[1], ".git")
+			if strings.EqualFold(parts[0]+"/"+repoName, defaultManagementRepo) {
+				return defaultManagementReleaseURL
+			}
 			return fmt.Sprintf("https://api.github.com/repos/%s/%s/releases/latest", parts[0], repoName)
 		}
 	}
