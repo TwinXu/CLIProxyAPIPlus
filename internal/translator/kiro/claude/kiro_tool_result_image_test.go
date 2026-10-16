@@ -470,6 +470,7 @@ func TestJPEGAndGIFStructureIsChecked(t *testing.T) {
 		"no DQT":             without(0xDB),
 		"no frame header":    without(0xC0),
 		"no EOI":             good[:len(good)-2],
+		"EOI cut after 0xFF": good[:len(good)-1],
 		"wider than allowed": tooWide,
 	} {
 		if jpegComplete(b) {
@@ -548,8 +549,8 @@ func TestToolImageChecksAgreeWithKiro(t *testing.T) {
 	if err := json.Unmarshal(raw, &measured); err != nil {
 		t.Fatal(err)
 	}
-	if len(measured.Cases) != 158 {
-		t.Fatalf("read %d measured cases, want 158", len(measured.Cases))
+	if len(measured.Cases) != 163 {
+		t.Fatalf("read %d measured cases, want 163", len(measured.Cases))
 	}
 	for _, c := range measured.Cases {
 		want := c.KiroStatus == 200 && !kiroTakesButNotForwarded[c.Name]

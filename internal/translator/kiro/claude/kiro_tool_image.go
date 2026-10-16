@@ -590,14 +590,24 @@ func isJPEGFrameMarker(m byte) bool {
 }
 
 // jpegScanEnd returns where the marker ending the entropy-coded data at pos
-// begins: an 0xFF followed by neither a stuffed zero nor a restart code.
+// begins: a run of 0xFF followed by neither a stuffed zero nor a restart
+// code. The run may hold fill bytes, as libjpeg reads it; Kiro took fill
+// bytes before restart markers and before a stuffed zero.
 func jpegScanEnd(b []byte, pos int) int {
-	for ; pos+1 < len(b); pos++ {
-		if b[pos] == 0xFF && b[pos+1] != 0x00 && (b[pos+1] < 0xD0 || b[pos+1] > 0xD7) {
-			return pos
+	for {
+		i := bytes.IndexByte(b[pos:], 0xFF)
+		if i < 0 {
+			return len(b)
 		}
+		run, next := pos+i, pos+i+1
+		for next < len(b) && b[next] == 0xFF {
+			next++
+		}
+		if next == len(b) || (b[next] != 0x00 && (b[next] < 0xD0 || b[next] > 0xD7)) {
+			return run
+		}
+		pos = next + 1
 	}
-	return len(b)
 }
 
 // gifComplete walks the blocks through the trailer, checking every frame
