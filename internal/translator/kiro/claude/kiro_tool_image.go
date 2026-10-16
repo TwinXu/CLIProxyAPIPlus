@@ -52,8 +52,6 @@ const (
 	kiroMaxToolImageBytes = 5 << 20
 	// kiroMaxImageSide is the largest side forwarded.
 	kiroMaxImageSide = 8000
-	// kiroMaxPNGRowBytes bounds the inflate work for one PNG.
-	kiroMaxPNGRowBytes = 64 << 20
 	// kiroMaxJPEGScans is far above the ten or so scans real progressive files use.
 	kiroMaxJPEGScans = 100
 )
@@ -298,13 +296,13 @@ func pngChannels(colorType, depth byte) (uint64, bool) {
 
 // pngRowsComplete inflates the IDAT stream that starts at the chunk at idat and
 // reports whether it holds exactly the given rows, each led by a valid filter.
+//
+// The side limit bounds the rows at 512 MB (8000x8000 16-bit RGBA), which
+// takes Go about 0.2 s to inflate on an Apple M5; Kiro takes such images.
 func pngRowsComplete(b []byte, idat int, spans []pngRowSpan) bool {
 	var want uint64
 	for _, s := range spans {
 		want += s.count * s.length
-	}
-	if want > kiroMaxPNGRowBytes {
-		return false
 	}
 	zr, err := zlib.NewReader(&pngIDATReader{b: b, pos: idat})
 	if err != nil {
@@ -448,6 +446,8 @@ func (h *jpegHeader) segment(marker byte, s []byte) bool {
 		return h.scans <= kiroMaxJPEGScans && h.scan(s)
 	case marker == 0xDD:
 		return len(s) == 2
+	case marker == 0xDC:
+		return false // DNL, before or after the first scan
 	}
 	return true
 }
@@ -502,8 +502,8 @@ func huffmanSymbols(counts []byte) (int, bool) {
 }
 
 // frame checks the frame header: 8-bit samples, a size within the side limit,
-// and 1, 3 or 4 components with distinct ids and sampling factors 1 to 4. An
-// image has one frame. A table id is checked when a scan uses the component.
+// and 1, 3 or 4 components with distinct ids and standard sampling. An image
+// has one frame. A table id is checked when a scan uses the component.
 func (h *jpegHeader) frame(s []byte, progressive bool) bool {
 	if h.ncomp != 0 || len(s) < 6 || s[0] != 8 {
 		return false
@@ -515,14 +515,27 @@ func (h *jpegHeader) frame(s []byte, progressive bool) bool {
 	}
 	for i := range n {
 		c := s[6+3*i : 9+3*i]
-		hs, vs := c[1]>>4, c[1]&0x0F
-		if _, dup := h.component(c[0]); dup || hs < 1 || hs > 4 || vs < 1 || vs > 4 {
+		if _, dup := h.component(c[0]); dup || !jpegSamplingOK(c[1], s[7]) {
 			return false
 		}
 		h.components[i], h.ncomp = jpegComponent{id: c[0], quant: c[2]}, i+1
 	}
 	h.progressive = progressive
 	return true
+}
+
+// jpegFirstSampling holds the sampling factors (horizontal, vertical) of the
+// first component in the standard subsamplings: 4:4:4, 4:2:2, 4:4:0, 4:2:0
+// and 4:1:1.
+var jpegFirstSampling = map[byte]bool{0x11: true, 0x21: true, 0x12: true, 0x22: true, 0x41: true}
+
+// jpegSamplingOK reports whether a component's sampling factors fit a
+// standard subsampling: the first component's are one of jpegFirstSampling,
+// and every other component's are 1x1 or the same. Kiro refused factors of 3,
+// chroma sampled finer than luma, and 4x4 luma with 2x2 chroma; it took some
+// other layouts that no common encoder writes, which are not forwarded.
+func jpegSamplingOK(factors, first byte) bool {
+	return jpegFirstSampling[first] && (factors == first || factors == 0x11)
 }
 
 func (h *jpegHeader) component(id byte) (int, bool) {

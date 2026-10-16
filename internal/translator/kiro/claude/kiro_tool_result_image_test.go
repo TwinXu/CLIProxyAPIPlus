@@ -365,14 +365,11 @@ func TestPNGStructureIsChecked(t *testing.T) {
 	notIHDRFirst := append([]byte("\x89PNG\r\n\x1a\n"), pngChunkBytes("abCD", good[16:29])...)
 	notIHDRFirst = append(notIHDRFirst, good[33:]...)
 	noIDAT := append(append([]byte(nil), good[:33]...), pngChunkBytes("IEND", nil)...)
-	// 8000x2100 RGBA rows are 67 MB inflated, beyond kiroMaxPNGRowBytes.
-	overBudget := testPNG(8000, 2100, 8, 6, 0, make([]byte, 2100*(1+8000*4)))
 	cases := map[string][]byte{
 		"compression method 1":    compressionOne,
 		"IDAT before IHDR":        idatFirst,
 		"first chunk not IHDR":    notIHDRFirst,
 		"no IDAT":                 noIDAT,
-		"rows over the budget":    overBudget,
 		"bad CRC":                 badCRC,
 		"filter type 5":           testPNG(1, 1, 8, 2, 0, []byte{5, 10, 20, 30}),
 		"missing row":             testPNG(1, 2, 8, 2, 0, rgbRow),
@@ -499,8 +496,43 @@ func TestJPEGAndGIFStructureIsChecked(t *testing.T) {
 	}
 }
 
+// A 4096x4096 RGBA PNG inflates to 64 MB of rows; Kiro takes it, and checking
+// it must not hold those rows.
+func TestLargePNGIsForwarded(t *testing.T) {
+	const side = 4096
+	header := binary.BigEndian.AppendUint32(binary.BigEndian.AppendUint32(nil, side), side)
+	header = append(header, 8, 6, 0, 0, 0)
+	var z bytes.Buffer
+	zw := zlib.NewWriter(&z)
+	row := make([]byte, 1+side*4)
+	for range side {
+		zw.Write(row)
+	}
+	zw.Close()
+	png := append([]byte("\x89PNG\r\n\x1a\n"), pngChunkBytes("IHDR", header)...)
+	png = append(png, pngChunkBytes("IDAT", z.Bytes())...)
+	png = append(png, pngChunkBytes("IEND", nil)...)
+	if grew := allocated(func() {
+		if !pngComplete(png) {
+			t.Error("a 4096x4096 RGBA PNG was refused")
+		}
+	}); grew > 1<<20 {
+		t.Errorf("checking it allocated %d bytes, want under 1 MiB", grew)
+	}
+}
+
+// kiroTakesButNotForwarded are JPEG sampling layouts Kiro took that no common
+// encoder writes; only the standard subsamplings are forwarded.
+var kiroTakesButNotForwarded = map[string]bool{
+	"S9 MCU 18 blocks (Y 4x4)": true,
+	"V5 sampling 22/21/11":     true,
+	"V9 sampling 44/11/11":     true,
+	"V10 sampling 42/21/21":    true,
+	"X10 sampling 22/12/21":    true,
+}
+
 // Every file Kiro was sent on 2026-10-16 to learn what it refuses: the checks
-// must forward exactly the ones it took.
+// must forward exactly the ones it took, apart from kiroTakesButNotForwarded.
 func TestToolImageChecksAgreeWithKiro(t *testing.T) {
 	raw, err := os.ReadFile("testdata/kiro_measured_images.json")
 	if err != nil {
@@ -516,12 +548,16 @@ func TestToolImageChecksAgreeWithKiro(t *testing.T) {
 	if err := json.Unmarshal(raw, &measured); err != nil {
 		t.Fatal(err)
 	}
-	if len(measured.Cases) != 128 {
-		t.Fatalf("read %d measured cases, want 128", len(measured.Cases))
+	if len(measured.Cases) != 158 {
+		t.Fatalf("read %d measured cases, want 158", len(measured.Cases))
 	}
 	for _, c := range measured.Cases {
-		if forwarded := checkToolImage(c.Data).format != ""; forwarded != (c.KiroStatus == 200) {
+		want := c.KiroStatus == 200 && !kiroTakesButNotForwarded[c.Name]
+		if forwarded := checkToolImage(c.Data).format != ""; forwarded != want {
 			t.Errorf("%s: forwarded=%v, Kiro answered %d", c.Name, forwarded, c.KiroStatus)
+		}
+		if kiroTakesButNotForwarded[c.Name] && c.KiroStatus != 200 {
+			t.Errorf("%s: listed as taken by Kiro, but Kiro answered %d", c.Name, c.KiroStatus)
 		}
 	}
 }
