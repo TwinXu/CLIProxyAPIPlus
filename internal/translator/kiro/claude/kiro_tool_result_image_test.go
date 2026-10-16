@@ -174,6 +174,21 @@ func TestToolResultImageIsValidatedBeforeForwarding(t *testing.T) {
 	}
 }
 
+func TestToolResultImageBytesAreCanonicalBase64(t *testing.T) {
+	wrapped := onePixelPNG[:40] + `\n` + onePixelPNG[40:]
+	msg := currentUserInput(t, `{"model":"claude-opus-4-1","max_tokens":1024,`+getImageTool+`,
+		"messages":[
+			{"role":"user","content":"Call get_image."},
+			{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"get_image","input":{}}]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":[
+				{"type":"image","source":{"type":"base64","media_type":"image/png","data":"`+wrapped+`"}}
+			]}]}
+		]}`)
+	if got := msg.Get("images.0.source.bytes").String(); got != onePixelPNG {
+		t.Fatalf("bytes = %q, want the line break removed: %q", got, onePixelPNG)
+	}
+}
+
 // Compaction can keep a tool_result whose tool_use is gone. The orphan result is
 // dropped, and its image must go with it rather than linger without context.
 func TestOrphanToolResultImageIsDroppedWithItsResult(t *testing.T) {

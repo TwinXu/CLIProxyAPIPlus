@@ -1182,12 +1182,12 @@ var kiroSniffedImageFormats = map[string]string{
 // kiroToolImageFromBlock converts a tool-result image only when Kiro will accept it.
 // A malformed or unsupported image makes Kiro reject the whole request, so the
 // bytes must decode and the format is taken from them, not from the declared type.
+// The bytes are re-encoded because the decoder tolerates line breaks.
 func kiroToolImageFromBlock(block gjson.Result) (KiroImage, bool) {
 	if block.Get("source.type").String() != "base64" {
 		return KiroImage{}, false
 	}
-	data := block.Get("source.data").String()
-	decoded, err := base64.StdEncoding.DecodeString(data)
+	decoded, err := base64.StdEncoding.DecodeString(block.Get("source.data").String())
 	if err != nil || len(decoded) == 0 {
 		return KiroImage{}, false
 	}
@@ -1195,7 +1195,7 @@ func kiroToolImageFromBlock(block gjson.Result) (KiroImage, bool) {
 	if !ok {
 		return KiroImage{}, false
 	}
-	return KiroImage{Format: format, Source: KiroImageSource{Bytes: data}}, true
+	return KiroImage{Format: format, Source: KiroImageSource{Bytes: base64.StdEncoding.EncodeToString(decoded)}}, true
 }
 
 // BuildAssistantMessageStruct builds an assistant message with tool uses
