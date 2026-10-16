@@ -167,6 +167,7 @@ type pngState struct {
 	width, height uint32
 	colorType     byte
 	sawPLTE       bool
+	sawIDAT       bool
 	seq           uint32 // the next APNG sequence number
 }
 
@@ -185,6 +186,7 @@ func (s *pngState) chunk(typ string, d []byte) bool {
 		s.sawPLTE = true
 		return len(d) > 0 && len(d)%3 == 0 && len(d) <= 3*256
 	case "IDAT":
+		s.sawIDAT = true
 		return s.colorType != 3 || s.sawPLTE
 	case "tRNS":
 		want, ok := pngTRNSLength[s.colorType]
@@ -202,7 +204,7 @@ func (s *pngState) chunk(typ string, d []byte) bool {
 	case "fcTL":
 		return s.next(d) && len(d) >= 26 && s.frameFits(d)
 	case "fdAT":
-		return s.next(d)
+		return s.sawIDAT && s.next(d)
 	}
 	return true
 }
@@ -217,11 +219,14 @@ func (s *pngState) next(d []byte) bool {
 }
 
 // frameFits checks an fcTL frame: nonempty, inside the image, and with a
-// defined dispose and blend operation.
+// defined dispose and blend operation. A frame ahead of IDAT is the default
+// image and must cover the whole image.
 func (s *pngState) frameFits(d []byte) bool {
 	w, h := uint64(binary.BigEndian.Uint32(d[4:])), uint64(binary.BigEndian.Uint32(d[8:]))
 	x, y := uint64(binary.BigEndian.Uint32(d[12:])), uint64(binary.BigEndian.Uint32(d[16:]))
-	return w > 0 && h > 0 && x+w <= uint64(s.width) && y+h <= uint64(s.height) && d[24] <= 2 && d[25] <= 1
+	whole := [4]uint64{w, h, x, y} == [4]uint64{uint64(s.width), uint64(s.height), 0, 0}
+	return w > 0 && h > 0 && x+w <= uint64(s.width) && y+h <= uint64(s.height) && d[24] <= 2 && d[25] <= 1 &&
+		(s.sawIDAT || whole)
 }
 
 // pngChunk returns the type and data of the chunk at pos and the position after

@@ -549,8 +549,8 @@ func TestToolImageChecksAgreeWithKiro(t *testing.T) {
 	if err := json.Unmarshal(raw, &measured); err != nil {
 		t.Fatal(err)
 	}
-	if len(measured.Cases) != 163 {
-		t.Fatalf("read %d measured cases, want 163", len(measured.Cases))
+	if len(measured.Cases) != 174 {
+		t.Fatalf("read %d measured cases, want 174", len(measured.Cases))
 	}
 	for _, c := range measured.Cases {
 		want := c.KiroStatus == 200 && !kiroTakesButNotForwarded[c.Name]
@@ -593,6 +593,7 @@ func TestAPNGChunksAreChecked(t *testing.T) {
 	for name, b := range map[string][]byte{
 		"fdAT out of sequence":    apng(fcTL(1, 2, 2, 0, 0, 0, 0), fdAT(9)),
 		"frame height 0":          apng(fcTL(1, 2, 0, 0, 0, 0, 0), fdAT(2)),
+		"frame width 0":           apng(fcTL(1, 0, 2, 0, 0, 0, 0), fdAT(2)),
 		"frame past the right":    apng(fcTL(1, 2, 2, 1, 0, 0, 0), fdAT(2)),
 		"frame past the bottom":   apng(fcTL(1, 2, 2, 0, 1, 0, 0), fdAT(2)),
 		"blend operation 2":       apng(fcTL(1, 2, 2, 0, 0, 0, 2), fdAT(2)),
