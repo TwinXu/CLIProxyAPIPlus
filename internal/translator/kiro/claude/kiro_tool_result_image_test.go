@@ -144,6 +144,16 @@ func TestToolResultImageIsValidatedBeforeForwarding(t *testing.T) {
 		{"svg", `{"type":"base64","media_type":"image/svg+xml","data":"` + svg + `"}`, ""},
 		{"png labelled jpeg", `{"type":"base64","media_type":"image/jpeg","data":"` + onePixelPNG + `"}`, "png"},
 		{"png labelled jpg", `{"type":"base64","media_type":"image/jpg","data":"` + onePixelPNG + `"}`, "png"},
+		{"jpeg labelled png", `{"type":"base64","media_type":"image/png","data":"` + eightPixelJpeg + `"}`, "jpeg"},
+		{"gif labelled png", `{"type":"base64","media_type":"image/png","data":"` + eightPixelGif + `"}`, "gif"},
+		{"webp labelled png", `{"type":"base64","media_type":"image/png","data":"` + eightPixelWebp + `"}`, "webp"},
+		{"non-base64 source type with valid data", `{"type":"file","media_type":"image/png","data":"` + onePixelPNG + `"}`, ""},
+		{"png signature only", `{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}`, ""},
+		{"truncated png", `{"type":"base64","media_type":"image/png","data":"` + truncatedPng + `"}`, ""},
+		{"truncated jpeg", `{"type":"base64","media_type":"image/jpeg","data":"` + truncatedJpeg + `"}`, ""},
+		{"truncated gif", `{"type":"base64","media_type":"image/gif","data":"` + truncatedGif + `"}`, ""},
+		{"truncated webp", `{"type":"base64","media_type":"image/webp","data":"` + truncatedWebp + `"}`, ""},
+		{"wider than kiroMaxImageSide", `{"type":"base64","media_type":"image/png","data":"` + tooWidePNG + `"}`, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -222,6 +232,73 @@ func TestOrphanToolResultImageIsDroppedWithItsResult(t *testing.T) {
 			if n := len(h.Get("userInputMessage.images").Array()); n != 0 {
 				t.Fatalf("history[%d] images = %d, want 0: %s", i, n, h.Raw)
 			}
+			if n := h.Get("userInputMessage.userInputMessageContext.toolResults.#").Int(); n != 0 {
+				t.Fatalf("history[%d] keeps %d orphan tool results: %s", i, n, h.Raw)
+			}
 		}
 	})
 }
+
+// toolUseIDs must name exactly the tool uses BuildAssistantMessageStruct emits;
+// the orphan filter used to derive its set from that output.
+func TestToolUseIDsMatchEmittedToolUses(t *testing.T) {
+	inputs := map[string]string{
+		"array content":     `[{"role":"assistant","content":[{"type":"text","text":"x"},{"type":"tool_use","id":"a","name":"n","input":{}}]}]`,
+		"string content":    `[{"role":"assistant","content":"tool_use a"}]`,
+		"object content":    `[{"role":"assistant","content":{"type":"tool_use","id":"a","name":"n","input":{}}}]`,
+		"duplicate ids":     `[{"role":"assistant","content":[{"type":"tool_use","id":"a","name":"n","input":{}},{"type":"tool_use","id":"a","name":"n","input":{}}]}]`,
+		"empty id":          `[{"role":"assistant","content":[{"type":"tool_use","id":"","name":"n","input":{}}]}]`,
+		"web_search":        `[{"role":"assistant","content":[{"type":"tool_use","id":"w","name":"web_search","input":{"query":"q"}}]}]`,
+		"tool_use in user":  `[{"role":"user","content":[{"type":"tool_use","id":"u","name":"n","input":{}}]}]`,
+		"text part with id": `[{"role":"assistant","content":[{"type":"text","id":"x","text":"hi"}]}]`,
+	}
+	for name, raw := range inputs {
+		messages := gjson.Parse(raw).Array()
+		emitted := make(map[string]bool)
+		for _, msg := range messages {
+			if msg.Get("role").String() == "assistant" {
+				for _, tu := range BuildAssistantMessageStruct(msg).ToolUses {
+					emitted[tu.ToolUseID] = true
+				}
+			}
+		}
+		got := toolUseIDs(messages)
+		if len(got) != len(emitted) {
+			t.Fatalf("%s: toolUseIDs = %v, emitted = %v", name, got, emitted)
+		}
+		for id := range emitted {
+			if !got[id] {
+				t.Fatalf("%s: toolUseIDs = %v, emitted = %v", name, got, emitted)
+			}
+		}
+	}
+}
+
+// A verdict is cached per data string, so a second sighting (the next turn's
+// history) must give the same result as the first.
+func TestToolImageVerdictIsStableAcrossTurns(t *testing.T) {
+	wrapped := onePixelPNG[:30] + "\n" + onePixelPNG[30:]
+	for turn := 0; turn < 2; turn++ {
+		img, ok := kiroToolImageFromBlock(gjson.Parse(`{"type":"image","source":{"type":"base64","media_type":"image/png","data":` + strconvQuote(wrapped) + `}}`))
+		if !ok || img.Source.Bytes != onePixelPNG {
+			t.Fatalf("turn %d: wrapped image = %v %q, want canonical bytes", turn, ok, img.Source.Bytes)
+		}
+		if _, ok := kiroToolImageFromBlock(gjson.Parse(`{"type":"image","source":{"type":"base64","media_type":"image/png","data":"` + truncatedPng + `"}}`)); ok {
+			t.Fatalf("turn %d: truncated image forwarded", turn)
+		}
+	}
+}
+
+func strconvQuote(s string) string {
+	return `"` + strings.ReplaceAll(s, "\n", `\n`) + `"`
+}
+
+// Fixtures generated with Pillow: 8x8 solid green images and an 8001x1 PNG.
+const eightPixelJpeg = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAAIAAgDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDnaKKK+QPgz//Z"
+const eightPixelGif = "R0lGODdhCAAIAIEAAACgAAAAAAAAAAAAACwAAAAACAAIAAAIDwABCBxIsKDBgwgTKkwYEAA7"
+const eightPixelWebp = "UklGRjwAAABXRUJQVlA4IDAAAAAQAgCdASoIAAgAAUAmJaACdLoB+AH4AAPIAP7vdtf+mijCmPuTf/Z3NqpD+3cAAAA="
+const truncatedJpeg = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAAIAAgDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dg=="
+const truncatedGif = "R0lGODdhCAAIAIEAAACgAAAAAAAAAAAAACwA"
+const truncatedWebp = "UklGRjwAAABXRUJQVlA4IDAAAAAQAgCdASoIAAgAAUAmJQ=="
+const truncatedPng = "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAE0k="
+const tooWidePNG = "iVBORw0KGgoAAAANSUhEUgAAH0EAAAABCAIAAAAzw2RzAAAAMUlEQVR4nO3BAQ0AAAjAoNu/hFHdzAFMGwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAvQNYPQCibHM58wAAAABJRU5ErkJggg=="

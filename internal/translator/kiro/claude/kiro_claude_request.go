@@ -4,7 +4,6 @@
 package claude
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -975,15 +974,17 @@ func processMessages(messages gjson.Result, modelID, origin string) ([]KiroHisto
 	return history, currentUserMsg, currentToolResults
 }
 
-// toolUseIDs collects the ID of every tool_use carried by an assistant message.
-// A tool_result whose ID is not among them is an orphan.
+// toolUseIDs collects the ID of every tool_use that BuildAssistantMessageStruct
+// emits, which reads tool uses from array content only. A tool_result whose ID
+// is not among them is an orphan.
 func toolUseIDs(messages []gjson.Result) map[string]bool {
 	ids := make(map[string]bool)
 	for _, msg := range messages {
-		if msg.Get("role").String() != "assistant" {
+		content := msg.Get("content")
+		if msg.Get("role").String() != "assistant" || !content.IsArray() {
 			continue
 		}
-		for _, part := range msg.Get("content").Array() {
+		for _, part := range content.Array() {
 			if part.Get("type").String() == "tool_use" {
 				ids[part.Get("id").String()] = true
 			}
@@ -1111,7 +1112,11 @@ func BuildUserMessageStruct(msg gjson.Result, modelID, origin string, validToolU
 							// user message that holds this result, and the result says so.
 							// An orphan result is dropped later, so its image stays behind.
 							note := "[The tool returned an image that could not be forwarded.]"
-							if img, ok := kiroToolImageFromBlock(item); ok && validToolUseIDs[toolUseID] {
+							img, ok := KiroImage{}, false
+							if validToolUseIDs[toolUseID] {
+								img, ok = kiroToolImageFromBlock(item)
+							}
+							if ok {
 								images = append(images, img)
 								note = fmt.Sprintf("[The tool returned an image; it is attached to this message as image %d.]", len(images))
 							}
@@ -1169,33 +1174,6 @@ func kiroImageFromBlock(block gjson.Result) (KiroImage, bool) {
 		return KiroImage{}, false
 	}
 	return KiroImage{Format: format, Source: KiroImageSource{Bytes: data}}, true
-}
-
-// kiroSniffedImageFormats lists the formats Kiro accepts, keyed by sniffed content type.
-var kiroSniffedImageFormats = map[string]string{
-	"image/png":  "png",
-	"image/jpeg": "jpeg",
-	"image/gif":  "gif",
-	"image/webp": "webp",
-}
-
-// kiroToolImageFromBlock converts a tool-result image only when Kiro will accept it.
-// A malformed or unsupported image makes Kiro reject the whole request, so the
-// bytes must decode and the format is taken from them, not from the declared type.
-// The bytes are re-encoded because the decoder tolerates line breaks.
-func kiroToolImageFromBlock(block gjson.Result) (KiroImage, bool) {
-	if block.Get("source.type").String() != "base64" {
-		return KiroImage{}, false
-	}
-	decoded, err := base64.StdEncoding.DecodeString(block.Get("source.data").String())
-	if err != nil || len(decoded) == 0 {
-		return KiroImage{}, false
-	}
-	format, ok := kiroSniffedImageFormats[http.DetectContentType(decoded)]
-	if !ok {
-		return KiroImage{}, false
-	}
-	return KiroImage{Format: format, Source: KiroImageSource{Bytes: base64.StdEncoding.EncodeToString(decoded)}}, true
 }
 
 // BuildAssistantMessageStruct builds an assistant message with tool uses
