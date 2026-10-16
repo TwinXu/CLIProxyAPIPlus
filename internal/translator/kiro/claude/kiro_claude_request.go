@@ -874,12 +874,14 @@ func processMessages(messages gjson.Result, modelID, origin string) ([]KiroHisto
 		log.Infof("kiro: messages started with assistant role, prepended placeholder user message for Kiro API compatibility")
 	}
 
+	validToolUseIDs := toolUseIDs(messagesArray)
+
 	for i, msg := range messagesArray {
 		role := msg.Get("role").String()
 		isLastMessage := i == len(messagesArray)-1
 
 		if role == "user" {
-			userMsg, toolResults := BuildUserMessageStruct(msg, modelID, origin)
+			userMsg, toolResults := BuildUserMessageStruct(msg, modelID, origin, validToolUseIDs)
 			// CRITICAL: Kiro API requires content to be non-empty for ALL user messages
 			// This includes both history messages and the current message.
 			// When user message contains only tool_result (no text), content will be empty.
@@ -931,14 +933,6 @@ func processMessages(messages gjson.Result, modelID, origin string) ([]KiroHisto
 	// the conversation and removes the assistant message containing the tool_use,
 	// but keeps the user message with the corresponding tool_result.
 	// Without this fix, Kiro API returns "Improperly formed request".
-	validToolUseIDs := make(map[string]bool)
-	for _, h := range history {
-		if h.AssistantResponseMessage != nil {
-			for _, tu := range h.AssistantResponseMessage.ToolUses {
-				validToolUseIDs[tu.ToolUseID] = true
-			}
-		}
-	}
 
 	// Filter orphaned tool results from history user messages
 	for i, h := range history {
@@ -978,6 +972,25 @@ func processMessages(messages gjson.Result, modelID, origin string) ([]KiroHisto
 	}
 
 	return history, currentUserMsg, currentToolResults
+}
+
+// toolUseIDs collects the ID of every tool_use that BuildAssistantMessageStruct
+// emits, which reads tool uses from array content only. A tool_result whose ID
+// is not among them is an orphan.
+func toolUseIDs(messages []gjson.Result) map[string]bool {
+	ids := make(map[string]bool)
+	for _, msg := range messages {
+		content := msg.Get("content")
+		if msg.Get("role").String() != "assistant" || !content.IsArray() {
+			continue
+		}
+		for _, part := range content.Array() {
+			if part.Get("type").String() == "tool_use" {
+				ids[part.Get("id").String()] = true
+			}
+		}
+	}
+	return ids
 }
 
 // buildFinalContent builds the final content with system prompt
@@ -1053,8 +1066,9 @@ func extractClaudeToolChoiceHint(claudeBody []byte) string {
 	return ""
 }
 
-// BuildUserMessageStruct builds a user message and extracts tool results
-func BuildUserMessageStruct(msg gjson.Result, modelID, origin string) (KiroUserInputMessage, []KiroToolResult) {
+// BuildUserMessageStruct builds a user message and extracts tool results.
+// validToolUseIDs holds the tool_use IDs the conversation still contains.
+func BuildUserMessageStruct(msg gjson.Result, modelID, origin string, validToolUseIDs map[string]bool) (KiroUserInputMessage, []KiroToolResult) {
 	content := msg.Get("content")
 	var contentBuilder strings.Builder
 	var toolResults []KiroToolResult
@@ -1070,21 +1084,8 @@ func BuildUserMessageStruct(msg gjson.Result, modelID, origin string) (KiroUserI
 			case "text":
 				contentBuilder.WriteString(part.Get("text").String())
 			case "image":
-				mediaType := part.Get("source.media_type").String()
-				data := part.Get("source.data").String()
-
-				format := ""
-				if idx := strings.LastIndex(mediaType, "/"); idx != -1 {
-					format = mediaType[idx+1:]
-				}
-
-				if format != "" && data != "" {
-					images = append(images, KiroImage{
-						Format: format,
-						Source: KiroImageSource{
-							Bytes: data,
-						},
-					})
+				if img, ok := kiroImageFromBlock(part); ok {
+					images = append(images, img)
 				}
 			case "tool_result":
 				toolUseID := part.Get("tool_use_id").String()
@@ -1103,9 +1104,24 @@ func BuildUserMessageStruct(msg gjson.Result, modelID, origin string) (KiroUserI
 
 				if resultContent.IsArray() {
 					for _, item := range resultContent.Array() {
-						if item.Get("type").String() == "text" {
+						switch {
+						case item.Get("type").String() == "text":
 							textContents = append(textContents, KiroTextContent{Text: item.Get("text").String()})
-						} else if item.Type == gjson.String {
+						case item.Get("type").String() == "image":
+							// Kiro tool results carry text only. The image rides on the
+							// user message that holds this result, and the result says so.
+							// An orphan result is dropped later, so its image stays behind.
+							note := "[The tool returned an image that could not be forwarded.]"
+							img, ok := KiroImage{}, false
+							if validToolUseIDs[toolUseID] {
+								img, ok = kiroToolImageFromBlock(item)
+							}
+							if ok {
+								images = append(images, img)
+								note = fmt.Sprintf("[The tool returned an image; it is attached to this message as image %d.]", len(images))
+							}
+							textContents = append(textContents, KiroTextContent{Text: note})
+						case item.Type == gjson.String:
 							textContents = append(textContents, KiroTextContent{Text: item.String()})
 						}
 					}
@@ -1144,6 +1160,20 @@ func BuildUserMessageStruct(msg gjson.Result, modelID, origin string) (KiroUserI
 	}
 
 	return userMsg, toolResults
+}
+
+// kiroImageFromBlock converts an Anthropic base64 image block to Kiro's image format.
+func kiroImageFromBlock(block gjson.Result) (KiroImage, bool) {
+	mediaType := block.Get("source.media_type").String()
+	data := block.Get("source.data").String()
+	format := ""
+	if idx := strings.LastIndex(mediaType, "/"); idx != -1 {
+		format = mediaType[idx+1:]
+	}
+	if format == "" || data == "" {
+		return KiroImage{}, false
+	}
+	return KiroImage{Format: format, Source: KiroImageSource{Bytes: data}}, true
 }
 
 // BuildAssistantMessageStruct builds an assistant message with tool uses
