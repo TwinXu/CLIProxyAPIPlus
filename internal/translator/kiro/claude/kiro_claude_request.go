@@ -1070,21 +1070,8 @@ func BuildUserMessageStruct(msg gjson.Result, modelID, origin string) (KiroUserI
 			case "text":
 				contentBuilder.WriteString(part.Get("text").String())
 			case "image":
-				mediaType := part.Get("source.media_type").String()
-				data := part.Get("source.data").String()
-
-				format := ""
-				if idx := strings.LastIndex(mediaType, "/"); idx != -1 {
-					format = mediaType[idx+1:]
-				}
-
-				if format != "" && data != "" {
-					images = append(images, KiroImage{
-						Format: format,
-						Source: KiroImageSource{
-							Bytes: data,
-						},
-					})
+				if img, ok := kiroImageFromBlock(part); ok {
+					images = append(images, img)
 				}
 			case "tool_result":
 				toolUseID := part.Get("tool_use_id").String()
@@ -1103,9 +1090,19 @@ func BuildUserMessageStruct(msg gjson.Result, modelID, origin string) (KiroUserI
 
 				if resultContent.IsArray() {
 					for _, item := range resultContent.Array() {
-						if item.Get("type").String() == "text" {
+						switch {
+						case item.Get("type").String() == "text":
 							textContents = append(textContents, KiroTextContent{Text: item.Get("text").String()})
-						} else if item.Type == gjson.String {
+						case item.Get("type").String() == "image":
+							// Kiro tool results carry text only. The image rides on the
+							// user message that holds this result, and the result says so.
+							note := "[The tool returned an image that could not be forwarded.]"
+							if img, ok := kiroImageFromBlock(item); ok {
+								images = append(images, img)
+								note = fmt.Sprintf("[The tool returned an image; it is attached to this message as image %d.]", len(images))
+							}
+							textContents = append(textContents, KiroTextContent{Text: note})
+						case item.Type == gjson.String:
 							textContents = append(textContents, KiroTextContent{Text: item.String()})
 						}
 					}
@@ -1144,6 +1141,20 @@ func BuildUserMessageStruct(msg gjson.Result, modelID, origin string) (KiroUserI
 	}
 
 	return userMsg, toolResults
+}
+
+// kiroImageFromBlock converts an Anthropic base64 image block to Kiro's image format.
+func kiroImageFromBlock(block gjson.Result) (KiroImage, bool) {
+	mediaType := block.Get("source.media_type").String()
+	data := block.Get("source.data").String()
+	format := ""
+	if idx := strings.LastIndex(mediaType, "/"); idx != -1 {
+		format = mediaType[idx+1:]
+	}
+	if format == "" || data == "" {
+		return KiroImage{}, false
+	}
+	return KiroImage{Format: format, Source: KiroImageSource{Bytes: data}}, true
 }
 
 // BuildAssistantMessageStruct builds an assistant message with tool uses
