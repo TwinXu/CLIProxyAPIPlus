@@ -5,6 +5,7 @@ import (
 	"compress/zlib"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
 	"hash/crc32"
 	"os"
 	"runtime"
@@ -360,9 +361,9 @@ func TestPNGStructureIsChecked(t *testing.T) {
 	idatFirst := append([]byte("\x89PNG\r\n\x1a\n"), good[33:len(good)-12]...)
 	idatFirst = append(idatFirst, good[8:33]...)
 	idatFirst = append(idatFirst, good[len(good)-12:]...)
-	// A chunk shaped like IHDR but named otherwise, ahead of the real one.
+	// The header chunk renamed, so the file has none.
 	notIHDRFirst := append([]byte("\x89PNG\r\n\x1a\n"), pngChunkBytes("abCD", good[16:29])...)
-	notIHDRFirst = append(notIHDRFirst, good[8:]...)
+	notIHDRFirst = append(notIHDRFirst, good[33:]...)
 	noIDAT := append(append([]byte(nil), good[:33]...), pngChunkBytes("IEND", nil)...)
 	// 8000x2100 RGBA rows are 67 MB inflated, beyond kiroMaxPNGRowBytes.
 	overBudget := testPNG(8000, 2100, 8, 6, 0, make([]byte, 2100*(1+8000*4)))
@@ -376,7 +377,6 @@ func TestPNGStructureIsChecked(t *testing.T) {
 		"filter type 5":           testPNG(1, 1, 8, 2, 0, []byte{5, 10, 20, 30}),
 		"missing row":             testPNG(1, 2, 8, 2, 0, rgbRow),
 		"extra pixel data":        testPNG(1, 1, 8, 2, 0, append(rgbRow, 0)),
-		"bytes after IEND":        append(append([]byte(nil), good...), 0),
 		"bad bit depth for RGB":   testPNG(1, 1, 4, 2, 0, []byte{0, 0xAB, 0xC0}), // rows sized for 4-bit RGB
 		"palette image, no PLTE":  testPNG(1, 1, 8, 3, 0, []byte{0, 0}),
 		"interlace method 2":      testPNG(1, 1, 8, 2, 2, rgbRow),
@@ -389,6 +389,9 @@ func TestPNGStructureIsChecked(t *testing.T) {
 	}
 	if !pngComplete(testPNG(1, 1, 8, 3, 0, []byte{0, 0}, pngChunkBytes("PLTE", []byte{1, 2, 3}))) {
 		t.Error("palette image with PLTE was refused")
+	}
+	if !pngComplete(append(append([]byte(nil), good...), 0)) {
+		t.Error("a byte after IEND made the PNG refused")
 	}
 }
 
@@ -427,7 +430,7 @@ func TestStructuralChecksStayCheapOnHostileInputs(t *testing.T) {
 	jpeg = append(jpeg, 0xFF, 0xDB, 0x00, 0x43, 0x00)
 	jpeg = append(jpeg, make([]byte, 64)...)
 	jpeg = append(jpeg, 0xFF, 0xC2, 0x00, 0x0B, 0x08, 0x00, 0x08, 0x00, 0x08, 0x01, 0x01, 0x11, 0x00)
-	jpeg = append(jpeg, 0xFF, 0xC4, 0x00, 0x14, 0x00, 0x01)
+	jpeg = append(jpeg, 0xFF, 0xC4, 0x00, 0x14, 0x10, 0x01) // AC table 0, one code
 	jpeg = append(jpeg, make([]byte, 16)...)
 	scan := []byte{0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x01, 0x3F, 0x10, 0x00}
 	for i := 0; i < kiroMaxJPEGScans; i++ {
@@ -489,6 +492,203 @@ func TestJPEGAndGIFStructureIsChecked(t *testing.T) {
 		"no trailer": gif[:len(gif)-1],
 		"zero width": zeroWidth,
 		"no frames":  noFrames,
+	} {
+		if gifComplete(b) {
+			t.Errorf("GIF %s: accepted", name)
+		}
+	}
+}
+
+// Every file Kiro was sent on 2026-10-16 to learn what it refuses: the checks
+// must forward exactly the ones it took.
+func TestToolImageChecksAgreeWithKiro(t *testing.T) {
+	raw, err := os.ReadFile("testdata/kiro_measured_images.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var measured struct {
+		Cases []struct {
+			Name       string `json:"name"`
+			KiroStatus int    `json:"kiro_status"`
+			Data       string `json:"data"`
+		} `json:"cases"`
+	}
+	if err := json.Unmarshal(raw, &measured); err != nil {
+		t.Fatal(err)
+	}
+	if len(measured.Cases) != 128 {
+		t.Fatalf("read %d measured cases, want 128", len(measured.Cases))
+	}
+	for _, c := range measured.Cases {
+		if forwarded := checkToolImage(c.Data).format != ""; forwarded != (c.KiroStatus == 200) {
+			t.Errorf("%s: forwarded=%v, Kiro answered %d", c.Name, forwarded, c.KiroStatus)
+		}
+	}
+}
+
+// The header fields the Kiro measurements do not reach on their own: each case
+// breaks one rule the checks enforce and keeps the rest of the file valid.
+func TestAPNGChunksAreChecked(t *testing.T) {
+	rows := []byte{0, 1, 2, 3, 4, 5, 6, 0, 1, 2, 3, 4, 5, 6} // 2x2 RGB
+	var z bytes.Buffer
+	zw := zlib.NewWriter(&z)
+	zw.Write(rows)
+	zw.Close()
+	fcTL := func(seq, w, h, x, y uint32, dispose, blend byte) []byte {
+		d := binary.BigEndian.AppendUint32(nil, seq)
+		for _, v := range []uint32{w, h, x, y} {
+			d = binary.BigEndian.AppendUint32(d, v)
+		}
+		return append(d, 0, 1, 0, 1, dispose, blend)
+	}
+	fdAT := func(seq uint32) []byte { return append(binary.BigEndian.AppendUint32(nil, seq), z.Bytes()...) }
+	// apng holds the default image and a second frame described by second.
+	apng := func(second, data []byte) []byte {
+		b := testPNG(2, 2, 8, 2, 0, rows, pngChunkBytes("acTL", []byte{0, 0, 0, 2, 0, 0, 0, 0}), pngChunkBytes("fcTL", fcTL(0, 2, 2, 0, 0, 0, 0)))
+		iend := len(b) - 12
+		out := append(append([]byte(nil), b[:iend]...), pngChunkBytes("fcTL", second)...)
+		out = append(out, pngChunkBytes("fdAT", data)...)
+		return append(out, b[iend:]...)
+	}
+	if !pngComplete(apng(fcTL(1, 2, 2, 0, 0, 2, 1), fdAT(2))) {
+		t.Fatal("a valid APNG was refused")
+	}
+	for name, b := range map[string][]byte{
+		"fdAT out of sequence":    apng(fcTL(1, 2, 2, 0, 0, 0, 0), fdAT(9)),
+		"frame height 0":          apng(fcTL(1, 2, 0, 0, 0, 0, 0), fdAT(2)),
+		"frame past the right":    apng(fcTL(1, 2, 2, 1, 0, 0, 0), fdAT(2)),
+		"frame past the bottom":   apng(fcTL(1, 2, 2, 0, 1, 0, 0), fdAT(2)),
+		"blend operation 2":       apng(fcTL(1, 2, 2, 0, 0, 0, 2), fdAT(2)),
+		"fcTL cut to eight bytes": apng(fcTL(1, 2, 2, 0, 0, 0, 0)[:8], fdAT(2)),
+	} {
+		if pngComplete(b) {
+			t.Errorf("APNG %s: accepted", name)
+		}
+	}
+}
+
+type jpegSegment struct {
+	marker byte
+	data   []byte
+}
+
+// splitJPEG returns the segments of b through its first scan header and the
+// bytes after them.
+func splitJPEG(b []byte) ([]jpegSegment, []byte) {
+	var segs []jpegSegment
+	for pos := 2; ; {
+		end := pos + 2 + int(binary.BigEndian.Uint16(b[pos+2:]))
+		segs = append(segs, jpegSegment{b[pos+1], b[pos+4 : end]})
+		if b[pos+1] == 0xDA {
+			return segs, b[end:]
+		}
+		pos = end
+	}
+}
+
+func joinJPEG(segs []jpegSegment, rest []byte) []byte {
+	out := []byte{0xFF, 0xD8}
+	for _, s := range segs {
+		out = append(append(out, 0xFF, s.marker), byte((len(s.data)+2)>>8), byte(len(s.data)+2))
+		out = append(out, s.data...)
+	}
+	return append(out, rest...)
+}
+
+func TestJPEGHeaderFieldsAreChecked(t *testing.T) {
+	good, _ := base64.StdEncoding.DecodeString(eightPixelJpeg)
+	segs, rest := splitJPEG(good) // APP0, DQT 0, DQT 1, SOF0, DHT x4, SOS
+	sof, sos := segs[3].data, segs[8].data
+	with := func(i int, data []byte) []byte {
+		edited := append([]jpegSegment(nil), segs...)
+		edited[i].data = data
+		return joinJPEG(edited, rest)
+	}
+	retag := func(marker byte) []byte {
+		edited := append([]jpegSegment(nil), segs...)
+		edited[3].marker = marker
+		return joinJPEG(edited, rest)
+	}
+	before := func(extra jpegSegment) []byte {
+		return joinJPEG(append([]jpegSegment{extra}, segs...), rest)
+	}
+	edit := func(b []byte, at int, v ...byte) []byte {
+		out := append([]byte(nil), b...)
+		copy(out[at:], v)
+		return out
+	}
+	counts := func(class byte, c ...byte) []byte {
+		return append([]byte{class}, append(c, make([]byte, 16-len(c))...)...)
+	}
+	manySymbols := append(counts(0x12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255), make([]byte, 510)...)
+	secondFrame := append(append([]byte(nil), rest[:len(rest)-2]...), joinJPEG([]jpegSegment{{0xC0, edit(sof, 6, 7, 0x11, 0, 8, 0x11, 0, 9, 0x11, 0)}}, []byte{0xFF, 0xD9})[2:]...)
+	twoComponents := joinJPEG(append(append([]jpegSegment(nil), segs[:3]...), append([]jpegSegment{{0xC0, append(edit(sof[:6], 5, 2), sof[6:12]...)}},
+		append(append([]jpegSegment(nil), segs[4:8]...), jpegSegment{0xDA, append(edit(sos[:5], 0, 2), sos[7:]...)})...)...), rest)
+	cases := map[string][]byte{
+		"no scan":                      joinJPEG(segs[:8], []byte{0xFF, 0xD9}),
+		"lossless frame":               retag(0xC3),
+		"arithmetic-coded frame":       retag(0xC9),
+		"quantization precision 2":     before(jpegSegment{0xDB, append([]byte{0x20}, make([]byte, 192)...)}),
+		"quantization table id 4":      before(jpegSegment{0xDB, append([]byte{0x04}, make([]byte, 64)...)}),
+		"Huffman table under 17 bytes": before(jpegSegment{0xC4, []byte{0x00, 1, 2, 3}}),
+		"Huffman table of 510 symbols": before(jpegSegment{0xC4, manySymbols}),
+		"Huffman class 2":              before(jpegSegment{0xC4, append(counts(0x20, 1), 0)}),
+		"Huffman table id 4":           before(jpegSegment{0xC4, append(counts(0x04, 1), 0)}),
+		"Huffman symbols missing":      before(jpegSegment{0xC4, counts(0x10, 1)}),
+		"second frame after the scan":  joinJPEG(segs, secondFrame),
+		"two components":               twoComponents,
+		"frame header a byte long":     with(3, append(append([]byte(nil), sof...), 0)),
+		"duplicate id, scanned once":   joinJPEG(append(append([]jpegSegment(nil), segs[:3]...), append([]jpegSegment{{0xC0, edit(sof, 9, 1)}}, append(append([]jpegSegment(nil), segs[4:8]...), jpegSegment{0xDA, []byte{1, 1, 0x00, 0, 63, 0}})...)...), rest),
+		"sampling factor 5":            with(3, edit(sof, 7, 0x51)),
+		"scan of no components":        with(8, []byte{0, 0, 63, 0}),
+		"scan header a byte long":      with(8, append(append([]byte(nil), sos...), 0)),
+		"DC table undefined":           with(8, edit(sos, 2, 0x20)),
+		"AC table undefined":           with(8, edit(sos, 2, 0x02)),
+	}
+	for name, b := range cases {
+		if jpegComplete(b) {
+			t.Errorf("JPEG %s: accepted", name)
+		}
+	}
+
+	// A progressive AC scan covers one component.
+	progressive := func(scan ...byte) []byte {
+		return joinJPEG([]jpegSegment{
+			{0xDB, append([]byte{0x00}, make([]byte, 64)...)},
+			{0xC2, []byte{8, 0, 8, 0, 8, 3, 1, 0x11, 0, 2, 0x11, 0, 3, 0x11, 0}},
+			{0xC4, append(counts(0x10, 1), 0)},
+			{0xDA, scan},
+		}, []byte{0xFF, 0xD9})
+	}
+	if !jpegComplete(progressive(1, 1, 0x00, 1, 63, 0)) {
+		t.Error("a progressive AC scan of one component was refused")
+	}
+	if jpegComplete(progressive(2, 1, 0x00, 2, 0x00, 1, 63, 0)) {
+		t.Error("a progressive AC scan of two components was accepted")
+	}
+}
+
+func TestGIFHeaderFieldsAreChecked(t *testing.T) {
+	gif, _ := base64.StdEncoding.DecodeString(eightPixelGif)
+	desc := 13 + gifTableLen(gif[10])
+	edit := func(at int, v ...byte) []byte {
+		out := append([]byte(nil), gif...)
+		copy(out[at:], v)
+		return out
+	}
+	insert := func(ext ...byte) []byte {
+		return append(append(append([]byte(nil), gif[:desc]...), ext...), gif[desc:]...)
+	}
+	if !gifComplete(insert(append(append([]byte{0x21, 0x01, 12}, make([]byte, 12)...), 0)...)) {
+		t.Fatal("a plain text extension of 12 bytes was refused")
+	}
+	for name, b := range map[string][]byte{
+		"plain text extension of 11 bytes": insert(append(append([]byte{0x21, 0x01, 11}, make([]byte, 11)...), 0)...),
+		"unknown extension, no data":       insert(0x21, 0x99, 0),
+		"frame at x 1, width 0":            edit(desc+1, 1, 0, 0, 0, 0, 0),
+		"frame at y 1, height 0":           edit(desc+3, 1, 0, 8, 0, 0, 0),
+		"frame ending past the side limit": edit(desc+1, binary.LittleEndian.AppendUint16(nil, kiroMaxImageSide)...),
+		"frame ending below the limit":     edit(desc+3, binary.LittleEndian.AppendUint16(nil, kiroMaxImageSide)...),
 	} {
 		if gifComplete(b) {
 			t.Errorf("GIF %s: accepted", name)
