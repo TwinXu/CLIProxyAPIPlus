@@ -3,9 +3,9 @@ package claude
 import (
 	"bytes"
 	"encoding/base64"
-	"encoding/binary"
 	"hash/maphash"
 	"image"
+	"image/color"
 	_ "image/gif"
 	_ "image/jpeg"
 	_ "image/png"
@@ -17,21 +17,31 @@ import (
 
 // Kiro decodes every image it receives and rejects the whole request when one
 // fails. Measured on 2026-10-16: bad base64, svg+xml, an image/jpg label, PNG
-// bytes labelled image/jpeg, a bare PNG signature, and PNG, JPEG, GIF and WebP
-// files cut short all returned 400. A tool image is therefore forwarded only
-// after it has been decoded here.
+// bytes labelled image/jpeg, a bare PNG signature, PNG, JPEG, GIF and WebP files
+// cut short, and an empty WebP envelope all returned 400; a GIF whose last frame
+// was cut short passed, so Kiro, like image.Decode, reads only the first frame.
+// A tool image is therefore forwarded only after it has been decoded here.
 
-// kiroSniffedImageFormats lists the formats Kiro accepts, keyed by sniffed content type.
+// kiroSniffedImageFormats lists the tool image formats this package can decode,
+// keyed by sniffed content type. Kiro also takes WebP, but the standard library
+// cannot decode it, so a damaged WebP would fail the whole request; WebP tool
+// images are not forwarded.
 var kiroSniffedImageFormats = map[string]string{
 	"image/png":  "png",
 	"image/jpeg": "jpeg",
 	"image/gif":  "gif",
-	"image/webp": "webp",
 }
 
-// kiroMaxImageSide bounds the pixels a check may allocate. Larger images are not
-// forwarded.
+// kiroMaxImageSide is the largest side forwarded.
 const kiroMaxImageSide = 8000
+
+// kiroMaxDecodeBytes bounds what one check may allocate. A tiny file can declare
+// a huge image, so the bound is applied to the header before decoding.
+const kiroMaxDecodeBytes = 128 << 20
+
+// kiroDecodeSlot lets one decode run at a time, so checks add at most
+// kiroMaxDecodeBytes to the process.
+var kiroDecodeSlot = make(chan struct{}, 1)
 
 // kiroToolImageVerdict is the outcome of checking one image's base64 data.
 type kiroToolImageVerdict struct {
@@ -100,21 +110,47 @@ func checkToolImage(data string) kiroToolImageVerdict {
 }
 
 func kiroImageDecodes(format string, b []byte) bool {
-	if format == "webp" {
-		// The standard library has no WebP decoder; check the container instead.
-		// This catches a truncated file but not damage inside it.
-		return webpContainerComplete(b)
-	}
 	cfg, _, err := image.DecodeConfig(bytes.NewReader(b))
 	if err != nil || cfg.Width <= 0 || cfg.Height <= 0 || cfg.Width > kiroMaxImageSide || cfg.Height > kiroMaxImageSide {
 		return false
 	}
+	if decodeAllocEstimate(format, cfg, len(b)) > kiroMaxDecodeBytes {
+		return false
+	}
+	kiroDecodeSlot <- struct{}{}
+	defer func() { <-kiroDecodeSlot }()
 	_, _, err = image.Decode(bytes.NewReader(b))
 	return err == nil
 }
 
-// webpContainerComplete reports whether the RIFF size of b, which the sniffer
-// already identified as WebP, covers exactly the bytes present.
-func webpContainerComplete(b []byte) bool {
-	return len(b) >= 12 && uint64(binary.LittleEndian.Uint32(b[4:8]))+8 == uint64(len(b))
+// decodeAllocEstimate overestimates what image.Decode allocates for an image.
+// Besides the pixels, decoders buffer in proportion to the encoded size; a
+// Pillow GIF of 128x128 took 3.85 bytes per pixel, most of it outside the image.
+func decodeAllocEstimate(format string, cfg image.Config, encodedLen int) uint64 {
+	return uint64(cfg.Width)*uint64(cfg.Height)*decodeBytesPerPixel(format, cfg.ColorModel) + 4*uint64(encodedLen)
+}
+
+// decodeBytesPerPixel overestimates what the standard decoders allocate per pixel.
+// Measured worst cases (bytes per pixel): progressive 4:4:4 JPEG 15.0, GIF 3.85,
+// interlaced 8-bit RGBA PNG 8.3, interlaced 16-bit RGBA PNG 16.5.
+func decodeBytesPerPixel(format string, model color.Model) uint64 {
+	switch format {
+	case "jpeg":
+		// A progressive JPEG keeps every DCT coefficient besides the pixels.
+		return 20
+	case "gif":
+		// Only the first frame is decoded.
+		return 4
+	}
+	// PNG: three times the pixel size of the model, since an interlaced image
+	// is decoded into pass images and then copied into the result.
+	switch model {
+	case color.GrayModel, color.AlphaModel:
+		return 3
+	case color.Gray16Model, color.Alpha16Model:
+		return 6
+	case color.RGBA64Model, color.NRGBA64Model:
+		return 24
+	}
+	return 12
 }

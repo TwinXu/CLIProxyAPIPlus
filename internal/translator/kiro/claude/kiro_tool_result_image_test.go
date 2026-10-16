@@ -1,8 +1,13 @@
 package claude
 
 import (
+	"bytes"
 	"encoding/base64"
+	"image"
+	"os"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/tidwall/gjson"
@@ -146,7 +151,8 @@ func TestToolResultImageIsValidatedBeforeForwarding(t *testing.T) {
 		{"png labelled jpg", `{"type":"base64","media_type":"image/jpg","data":"` + onePixelPNG + `"}`, "png"},
 		{"jpeg labelled png", `{"type":"base64","media_type":"image/png","data":"` + eightPixelJpeg + `"}`, "jpeg"},
 		{"gif labelled png", `{"type":"base64","media_type":"image/png","data":"` + eightPixelGif + `"}`, "gif"},
-		{"webp labelled png", `{"type":"base64","media_type":"image/png","data":"` + eightPixelWebp + `"}`, "webp"},
+		{"webp is not forwarded", `{"type":"base64","media_type":"image/webp","data":"` + eightPixelWebp + `"}`, ""},
+		{"empty webp envelope", `{"type":"base64","media_type":"image/webp","data":"UklGRggAAABXRUJQVlA4IA=="}`, ""},
 		{"non-base64 source type with valid data", `{"type":"file","media_type":"image/png","data":"` + onePixelPNG + `"}`, ""},
 		{"png signature only", `{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}`, ""},
 		{"truncated png", `{"type":"base64","media_type":"image/png","data":"` + truncatedPng + `"}`, ""},
@@ -276,6 +282,72 @@ func TestToolUseIDsMatchEmittedToolUses(t *testing.T) {
 
 // A verdict is cached per data string, so a second sighting (the next turn's
 // history) must give the same result as the first.
+// pngBomb is 66 bytes declaring an 8000x8000 16-bit RGBA image with no pixels;
+// decoding it would allocate 512 MB before failing.
+const pngBomb = "iVBORw0KGgoAAAANSUhEUgAAH0AAAB9AEAYAAABWYXG3AAAACUlEQVR4nGMAAAABAAFe/335AAAAAElFTkSuQmCC"
+
+func TestToolImageCheckBoundsMemoryBeforeDecoding(t *testing.T) {
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	_, ok := kiroToolImageFromBlock(gjson.Parse(`{"type":"image","source":{"type":"base64","media_type":"image/png","data":"` + pngBomb + `"}}`))
+	runtime.ReadMemStats(&after)
+	if ok {
+		t.Fatal("an image declaring 8000x8000 16-bit pixels was forwarded")
+	}
+	if grew := after.TotalAlloc - before.TotalAlloc; grew > 8<<20 {
+		t.Fatalf("checking the bomb allocated %d bytes, want under 8 MiB", grew)
+	}
+}
+
+// The memory bound is only as good as decodeAllocEstimate, so it must cover what
+// the decoder really allocates for the worst layout of each format. The
+// fixtures are a progressive 4:4:4 JPEG, interlaced 8- and 16-bit RGBA PNGs and
+// a Pillow GIF, the heaviest cases measured.
+func TestDecodeAllocEstimateCoversActualAllocation(t *testing.T) {
+	for _, name := range []string{"progressive_444.jpg", "interlaced_rgba8.png", "interlaced_rgba16.png", "pillow_gradient.gif"} {
+		b, err := os.ReadFile("testdata/" + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg, format, err := image.DecodeConfig(bytes.NewReader(b))
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		estimate := decodeAllocEstimate(format, cfg, len(b))
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		if _, _, err := image.Decode(bytes.NewReader(b)); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		runtime.ReadMemStats(&after)
+		if used := after.TotalAlloc - before.TotalAlloc; used > estimate {
+			t.Errorf("%s: decoding allocated %d bytes, estimate %d", name, used, estimate)
+		}
+	}
+}
+
+func TestToolImageChecksAgreeUnderConcurrency(t *testing.T) {
+	inputs := map[string]bool{onePixelPNG: true, eightPixelJpeg: true, eightPixelGif: true, truncatedPng: false, truncatedJpeg: false, pngBomb: false}
+	var wg sync.WaitGroup
+	errs := make(chan string, 64)
+	for i := 0; i < 8; i++ {
+		for data, want := range inputs {
+			wg.Add(1)
+			go func(data string, want bool) {
+				defer wg.Done()
+				if _, ok := kiroToolImageFromBlock(gjson.Parse(`{"type":"image","source":{"type":"base64","media_type":"image/png","data":"` + data + `"}}`)); ok != want {
+					errs <- data[:12]
+				}
+			}(data, want)
+		}
+	}
+	wg.Wait()
+	close(errs)
+	for e := range errs {
+		t.Errorf("concurrent check of %s... gave the wrong verdict", e)
+	}
+}
+
 func TestToolImageVerdictIsStableAcrossTurns(t *testing.T) {
 	wrapped := onePixelPNG[:30] + "\n" + onePixelPNG[30:]
 	for turn := 0; turn < 2; turn++ {
