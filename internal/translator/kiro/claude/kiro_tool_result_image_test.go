@@ -2,8 +2,10 @@ package claude
 
 import (
 	"bytes"
+	"compress/zlib"
 	"encoding/base64"
-	"image"
+	"encoding/binary"
+	"hash/crc32"
 	"os"
 	"runtime"
 	"strings"
@@ -280,49 +282,227 @@ func TestToolUseIDsMatchEmittedToolUses(t *testing.T) {
 	}
 }
 
-// A verdict is cached per data string, so a second sighting (the next turn's
-// history) must give the same result as the first.
 // pngBomb is 66 bytes declaring an 8000x8000 16-bit RGBA image with no pixels;
-// decoding it would allocate 512 MB before failing.
+// the standard decoder allocates 512 MB for it before failing.
 const pngBomb = "iVBORw0KGgoAAAANSUhEUgAAH0AAAB9AEAYAAABWYXG3AAAACUlEQVR4nGMAAAABAAFe/335AAAAAElFTkSuQmCC"
 
-func TestToolImageCheckBoundsMemoryBeforeDecoding(t *testing.T) {
+// allocated returns the bytes f allocates.
+func allocated(f func()) uint64 {
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)
-	_, ok := kiroToolImageFromBlock(gjson.Parse(`{"type":"image","source":{"type":"base64","media_type":"image/png","data":"` + pngBomb + `"}}`))
+	f()
 	runtime.ReadMemStats(&after)
+	return after.TotalAlloc - before.TotalAlloc
+}
+
+func TestToolImageCheckBoundsMemoryBeforeDecoding(t *testing.T) {
+	var ok bool
+	grew := allocated(func() {
+		_, ok = kiroToolImageFromBlock(gjson.Parse(`{"type":"image","source":{"type":"base64","media_type":"image/png","data":"` + pngBomb + `"}}`))
+	})
 	if ok {
 		t.Fatal("an image declaring 8000x8000 16-bit pixels was forwarded")
 	}
-	if grew := after.TotalAlloc - before.TotalAlloc; grew > 8<<20 {
+	if grew > 8<<20 {
 		t.Fatalf("checking the bomb allocated %d bytes, want under 8 MiB", grew)
 	}
 }
 
-// The memory bound is only as good as decodeAllocEstimate, so it must cover what
-// the decoder really allocates for the worst layout of each format. The
-// fixtures are a progressive 4:4:4 JPEG, interlaced 8- and 16-bit RGBA PNGs and
-// a Pillow GIF, the heaviest cases measured.
-func TestDecodeAllocEstimateCoversActualAllocation(t *testing.T) {
-	for _, name := range []string{"progressive_444.jpg", "interlaced_rgba8.png", "interlaced_rgba16.png", "pillow_gradient.gif"} {
+// Valid files in the layouts hardest to parse: progressive 4:4:4 JPEG, Adam7
+// interlaced 8- and 16-bit RGBA PNGs, and a Pillow GIF.
+func TestWholeImagesInTrickyLayoutsAreForwarded(t *testing.T) {
+	for name, format := range map[string]string{"progressive_444.jpg": "jpeg", "interlaced_rgba8.png": "png", "interlaced_rgba16.png": "png", "pillow_gradient.gif": "gif"} {
 		b, err := os.ReadFile("testdata/" + name)
 		if err != nil {
 			t.Fatal(err)
 		}
-		cfg, format, err := image.DecodeConfig(bytes.NewReader(b))
-		if err != nil {
-			t.Fatalf("%s: %v", name, err)
+		img, ok := kiroToolImageFromBlock(gjson.Parse(`{"type":"image","source":{"type":"base64","media_type":"image/png","data":"` + base64.StdEncoding.EncodeToString(b) + `"}}`))
+		if !ok || img.Format != format {
+			t.Errorf("%s: forwarded=%v format=%q, want %s", name, ok, img.Format, format)
 		}
-		estimate := decodeAllocEstimate(format, cfg, len(b))
-		var before, after runtime.MemStats
-		runtime.ReadMemStats(&before)
-		if _, _, err := image.Decode(bytes.NewReader(b)); err != nil {
-			t.Fatalf("%s: %v", name, err)
+	}
+}
+
+// testPNG assembles a PNG from a header, raw (already filtered) rows and extra
+// chunks placed before IDAT.
+func testPNG(w, h uint32, depth, colorType, interlace byte, rows []byte, extra ...[]byte) []byte {
+	header := binary.BigEndian.AppendUint32(binary.BigEndian.AppendUint32(nil, w), h)
+	header = append(header, depth, colorType, 0, 0, interlace)
+	var z bytes.Buffer
+	zw := zlib.NewWriter(&z)
+	zw.Write(rows)
+	zw.Close()
+	out := append([]byte("\x89PNG\r\n\x1a\n"), pngChunkBytes("IHDR", header)...)
+	for _, e := range extra {
+		out = append(out, e...)
+	}
+	out = append(out, pngChunkBytes("IDAT", z.Bytes())...)
+	return append(out, pngChunkBytes("IEND", nil)...)
+}
+
+func pngChunkBytes(typ string, data []byte) []byte {
+	c := binary.BigEndian.AppendUint32(nil, uint32(len(data)))
+	c = append(append(c, typ...), data...)
+	return binary.BigEndian.AppendUint32(c, crc32.ChecksumIEEE(c[4:]))
+}
+
+func TestPNGStructureIsChecked(t *testing.T) {
+	rgbRow := []byte{0, 10, 20, 30} // filter 0, one RGB pixel
+	good := testPNG(1, 1, 8, 2, 0, rgbRow)
+	if !pngComplete(good) {
+		t.Fatal("the builder's own valid PNG was refused")
+	}
+	badCRC := append([]byte(nil), good...)
+	badCRC[len(badCRC)-1] ^= 0xFF // the IEND CRC, which only the CRC check reads
+	compressionOne := append([]byte(nil), good...)
+	compressionOne[8+8+10] = 1 // IHDR compression method
+	compressionOne = append(compressionOne[:8], append(pngChunkBytes("IHDR", compressionOne[16:29]), compressionOne[33:]...)...)
+	idatFirst := append([]byte("\x89PNG\r\n\x1a\n"), good[33:len(good)-12]...)
+	idatFirst = append(idatFirst, good[8:33]...)
+	idatFirst = append(idatFirst, good[len(good)-12:]...)
+	// A chunk shaped like IHDR but named otherwise, ahead of the real one.
+	notIHDRFirst := append([]byte("\x89PNG\r\n\x1a\n"), pngChunkBytes("abCD", good[16:29])...)
+	notIHDRFirst = append(notIHDRFirst, good[8:]...)
+	noIDAT := append(append([]byte(nil), good[:33]...), pngChunkBytes("IEND", nil)...)
+	// 8000x2100 RGBA rows are 67 MB inflated, beyond kiroMaxPNGRowBytes.
+	overBudget := testPNG(8000, 2100, 8, 6, 0, make([]byte, 2100*(1+8000*4)))
+	cases := map[string][]byte{
+		"compression method 1":    compressionOne,
+		"IDAT before IHDR":        idatFirst,
+		"first chunk not IHDR":    notIHDRFirst,
+		"no IDAT":                 noIDAT,
+		"rows over the budget":    overBudget,
+		"bad CRC":                 badCRC,
+		"filter type 5":           testPNG(1, 1, 8, 2, 0, []byte{5, 10, 20, 30}),
+		"missing row":             testPNG(1, 2, 8, 2, 0, rgbRow),
+		"extra pixel data":        testPNG(1, 1, 8, 2, 0, append(rgbRow, 0)),
+		"bytes after IEND":        append(append([]byte(nil), good...), 0),
+		"bad bit depth for RGB":   testPNG(1, 1, 4, 2, 0, []byte{0, 0xAB, 0xC0}), // rows sized for 4-bit RGB
+		"palette image, no PLTE":  testPNG(1, 1, 8, 3, 0, []byte{0, 0}),
+		"interlace method 2":      testPNG(1, 1, 8, 2, 2, rgbRow),
+		"wider than the max side": testPNG(kiroMaxImageSide+1, 1, 8, 0, 0, append([]byte{0}, make([]byte, kiroMaxImageSide+1)...)),
+	}
+	for name, b := range cases {
+		if pngComplete(b) {
+			t.Errorf("%s: accepted", name)
 		}
-		runtime.ReadMemStats(&after)
-		if used := after.TotalAlloc - before.TotalAlloc; used > estimate {
-			t.Errorf("%s: decoding allocated %d bytes, estimate %d", name, used, estimate)
+	}
+	if !pngComplete(testPNG(1, 1, 8, 3, 0, []byte{0, 0}, pngChunkBytes("PLTE", []byte{1, 2, 3}))) {
+		t.Error("palette image with PLTE was refused")
+	}
+}
+
+// Codex review round 4 found inputs on which the standard decoders allocate or
+// loop without bound. The structural checks must stay cheap on all of them.
+func TestStructuralChecksStayCheapOnHostileInputs(t *testing.T) {
+	// Grayscale with tRNS, Adam7, 4000x4000: the decoder would expand it to NRGBA.
+	var rows []byte
+	for _, p := range adam7Passes {
+		pw, ph := passLen(4000, p.x0, p.dx), passLen(4000, p.y0, p.dy)
+		if pw > 0 {
+			rows = append(rows, make([]byte, ph*(1+pw))...)
 		}
+	}
+	grayTRNS := testPNG(4000, 4000, 8, 0, 1, rows, pngChunkBytes("tRNS", []byte{0, 0}))
+	if grew := allocated(func() {
+		if !pngComplete(grayTRNS) {
+			t.Error("valid interlaced grayscale PNG with tRNS was refused")
+		}
+	}); grew > 1<<20 {
+		t.Errorf("checking a 4000x4000 PNG allocated %d bytes, want under 1 MiB", grew)
+	}
+
+	// Two hundred thousand tiny ancillary chunks.
+	chunks := make([][]byte, 0, 200000)
+	for i := 0; i < cap(chunks); i++ {
+		chunks = append(chunks, pngChunkBytes("aaAa", []byte{0}))
+	}
+	manyChunks := testPNG(1, 1, 8, 2, 0, []byte{0, 1, 2, 3}, chunks...)
+	if grew := allocated(func() { pngComplete(manyChunks) }); grew > 1<<20 {
+		t.Errorf("walking 200000 chunks allocated %d bytes, want under 1 MiB", grew)
+	}
+
+	// A progressive JPEG header followed by more scans than any real file has.
+	jpeg := []byte{0xFF, 0xD8}
+	jpeg = append(jpeg, 0xFF, 0xDB, 0x00, 0x43, 0x00)
+	jpeg = append(jpeg, make([]byte, 64)...)
+	jpeg = append(jpeg, 0xFF, 0xC2, 0x00, 0x0B, 0x08, 0x00, 0x08, 0x00, 0x08, 0x01, 0x01, 0x11, 0x00)
+	jpeg = append(jpeg, 0xFF, 0xC4, 0x00, 0x14, 0x00, 0x01)
+	jpeg = append(jpeg, make([]byte, 16)...)
+	scan := []byte{0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x01, 0x3F, 0x10, 0x00}
+	for i := 0; i < kiroMaxJPEGScans; i++ {
+		jpeg = append(jpeg, scan...)
+	}
+	if !jpegComplete(append(append([]byte(nil), jpeg...), 0xFF, 0xD9)) {
+		t.Error("a JPEG with exactly kiroMaxJPEGScans scans was refused")
+	}
+	if jpegComplete(append(append(jpeg, scan...), 0xFF, 0xD9)) {
+		t.Error("a JPEG with more than kiroMaxJPEGScans scans was accepted")
+	}
+}
+
+func TestJPEGAndGIFStructureIsChecked(t *testing.T) {
+	good, _ := base64.StdEncoding.DecodeString(eightPixelJpeg)
+	if !jpegComplete(good) {
+		t.Fatal("a valid JPEG was refused")
+	}
+	// without removes every segment with the given marker.
+	without := func(marker byte) []byte {
+		out := []byte{0xFF, 0xD8}
+		for pos := 2; pos < len(good); {
+			m := good[pos+1]
+			if m == 0xDA {
+				return append(out, good[pos:]...)
+			}
+			end := pos + 2 + int(binary.BigEndian.Uint16(good[pos+2:]))
+			if m != marker {
+				out = append(out, good[pos:end]...)
+			}
+			pos = end
+		}
+		return out
+	}
+	tooWide := append([]byte(nil), good...)
+	sof := bytes.Index(tooWide, []byte{0xFF, 0xC0})
+	binary.BigEndian.PutUint16(tooWide[sof+7:], kiroMaxImageSide+1)
+	for name, b := range map[string][]byte{
+		"no DHT":             without(0xC4),
+		"no DQT":             without(0xDB),
+		"no frame header":    without(0xC0),
+		"no EOI":             good[:len(good)-2],
+		"wider than allowed": tooWide,
+	} {
+		if jpegComplete(b) {
+			t.Errorf("JPEG %s: accepted", name)
+		}
+	}
+
+	gif, _ := base64.StdEncoding.DecodeString(eightPixelGif)
+	if !gifComplete(gif) {
+		t.Fatal("a valid GIF was refused")
+	}
+	zeroWidth := append([]byte(nil), gif...)
+	zeroWidth[6], zeroWidth[7] = 0, 0
+	tableLen := gifTableLen(gif[10])
+	noFrames := append(append([]byte(nil), gif[:13+tableLen]...), 0x3B)
+	for name, b := range map[string][]byte{
+		"no trailer": gif[:len(gif)-1],
+		"zero width": zeroWidth,
+		"no frames":  noFrames,
+	} {
+		if gifComplete(b) {
+			t.Errorf("GIF %s: accepted", name)
+		}
+	}
+}
+
+func TestToolImagesOverAnthropicsSizeLimitAreRefused(t *testing.T) {
+	big := testPNG(1, 1, 8, 2, 0, []byte{0, 1, 2, 3}, pngChunkBytes("aaAa", make([]byte, kiroMaxToolImageBytes)))
+	if !pngComplete(big) {
+		t.Fatal("the oversized PNG is not structurally valid")
+	}
+	if checkToolImage(base64.StdEncoding.EncodeToString(big)).format != "" {
+		t.Error("a PNG over kiroMaxToolImageBytes was accepted")
 	}
 }
 
@@ -348,6 +528,8 @@ func TestToolImageChecksAgreeUnderConcurrency(t *testing.T) {
 	}
 }
 
+// A verdict is cached per data string, so a second sighting (the next turn's
+// history) must give the same result as the first.
 func TestToolImageVerdictIsStableAcrossTurns(t *testing.T) {
 	wrapped := onePixelPNG[:30] + "\n" + onePixelPNG[30:]
 	for turn := 0; turn < 2; turn++ {
